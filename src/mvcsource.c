@@ -84,23 +84,37 @@ static void ps_push(MvcSource *s, const uint8_t *nal, const uint8_t *end) {
  * picture is a type 1/5 NAL whose first_mb_in_slice == 0; ue(v)==0 is a single
  * '1' bit, so that is exactly the top bit of the first RBSP byte (emulation
  * prevention cannot affect the first byte).
+ *
+ * A base picture is only counted once a base-view SPS (type 7) and a PPS (type 8)
+ * have appeared earlier in the stream. This mirrors the decoder, which returns
+ * EBADMSG (and produces no frame) for a slice whose SPS/PPS is not yet
+ * initialized: a stream cut mid-GOP begins with VCL slices that reference the
+ * (now discarded) parameter sets of the previous GOP, and counting those would
+ * overcount num_frames - shifting every later display index and running past the
+ * real frames at the end. Cleanly demuxed streams start with SPS/PPS/IDR, so the
+ * guard is inert for them.
  */
 static void scan_index(MvcSource *s) {
 	const uint8_t *p = s->start, *end = s->end;
 	const uint8_t *au_start = s->start; /* start of the current access unit's leading NALs */
 	int in_vcl = 0;                     /* did we just pass this AU's VCL NALs? */
 	int frames = 0, is_mvc = 0;
+	int seen_sps = 0, seen_pps = 0;     /* a base-view SPS+PPS must precede a counted slice */
 	while (p < end) {
 		int type = p[0] & 0x1f;
 		int is_vcl = (type >= 1 && type <= 5) || type == 19 || type == 20;
 		if (!is_vcl && in_vcl) { au_start = p; in_vcl = 0; } /* leading NAL of the next AU */
 		if (type == 20 || type == 15)
 			is_mvc = 1;
+		if (type == 7)
+			seen_sps = 1;
+		else if (type == 8)
+			seen_pps = 1;
 		if (type == 7 || type == 8 || type == 13 || type == 15) { /* SPS/PPS/SPS-ext/subset-SPS */
 			const uint8_t *sc = edge264_find_start_code(p, end, 0);
 			ps_push(s, p, sc < end ? sc : end);
 		}
-		if ((type == 1 || type == 5) && (p + 1 < end) && (p[1] & 0x80)) { /* base primary picture */
+		if ((type == 1 || type == 5) && (p + 1 < end) && (p[1] & 0x80) && seen_sps && seen_pps) { /* base primary picture */
 			/* If this AU begins directly with its VCL NAL (no leading non-VCL
 			 * NAL advanced au_start), the first slice itself is the AU start.
 			 * Without this, au_start stays frozen at the previous boundary and

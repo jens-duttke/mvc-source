@@ -16,6 +16,14 @@
  *                recreated decoder is re-fed from a seek point that lacks SPS/PPS
  *                and every slice fails ("unexpected end of stream"). [P4-M-1]
  *
+ *   cut        : the stream cut mid-GOP so it begins with VCL slices that precede
+ *                any SPS/PPS (the Alba.264 case). The decoder returns EBADMSG for
+ *                those (no frame), so scan_index must not count them; counting
+ *                them overcounts num_frames, shifting every later display index
+ *                and leaving the tail unreadable. Checked both ways: seek ==
+ *                sequential, and num_frames is an exact frame-suffix of the full
+ *                stream.
+ *
  * The check is the project's core invariant: reading a frame after a seek must
  * be bit-identical to reading it in sequence. Reading every frame in reverse
  * order forces a backward seek onto each seek point in turn.
@@ -75,6 +83,26 @@ static Buf synth(const uint8_t *src, size_t n, int aud) {
 	}
 	put(&head, body.p, body.len); free(body.p);
 	return head;
+}
+
+/* Byte offset of the start code of the first non-IDR access unit that follows the
+ * first IDR. Cutting the stream here makes it begin mid-GOP, with slices that
+ * reference the (now removed) first-GOP parameter sets. Returns 0 if none. */
+static size_t mid_gop_cut_offset(const uint8_t *src, size_t n) {
+	const uint8_t *end = src + n;
+	int seen_idr = 0;
+	for (const uint8_t *p = find_sc(src, end); p < end; ) {
+		const uint8_t *pay = p + 3;                 /* NAL header byte */
+		const uint8_t *nx = find_sc(pay, end);
+		if (nx - pay >= 2) {
+			int type = pay[0] & 0x1f;
+			if (type == 5) seen_idr = 1;
+			else if (seen_idr && type == 1 && (pay[1] & 0x80)) /* post-IDR AU start */
+				return (size_t)(p - src);
+		}
+		p = nx;
+	}
+	return 0;
 }
 
 /* --- test driver ----------------------------------------------------------- */
@@ -137,6 +165,61 @@ static int check_seek_consistency(const char *label, const uint8_t *stream, size
 	return rc;
 }
 
+/* Decode an entire stream (given as bytes) and store each frame's Y-plane hash.
+ * Returns the frame count, or -1 on error / if it exceeds `cap` (message printed). */
+static int decode_hashes(const char *label, const uint8_t *stream, size_t n,
+                         uint64_t *h, int cap) {
+	char *path = write_temp(stream, n);
+	if (!path) { printf("FAIL[%s]: cannot write temp file\n", label); return -1; }
+	char err[256] = "";
+	MvcSource *s = mvc_open(path, 0, MVC_BASE, 0, 0, err, sizeof err);
+	if (!s) { printf("FAIL[%s]: open failed: %s\n", label, err); unlink(path); free(path); return -1; }
+	const MvcInfo *in = mvc_info(s);
+	int W = in->width, H = in->height, CW = W / 2, CH = H / 2, N = in->num_frames;
+	int rc = N;
+	if (N > cap) { printf("FAIL[%s]: %d frames exceed cap %d\n", label, N, cap); rc = -1; }
+	uint8_t *Y = malloc((size_t)W * H), *U = malloc((size_t)CW * CH), *V = malloc((size_t)CW * CH);
+	for (int i = 0; i < N && rc >= 0; i++) {
+		if (mvc_get_frame(s, i, Y, W, U, CW, V, CW, err, sizeof err)) {
+			printf("FAIL[%s]: frame %d: %s\n", label, i, err); rc = -1; break;
+		}
+		h[i] = hashp(Y, W, W, H);
+	}
+	mvc_close(s); free(Y); free(U); free(V); unlink(path); free(path);
+	return rc;
+}
+
+/* On a mid-GOP cut the leading slices reference now-removed parameter sets and
+ * cannot be decoded, so scan_index must not count them. Verify the cut's frames
+ * are an exact contiguous suffix of the full stream's frames and that num_frames
+ * reaches the real end - guarding the pre-SPS/PPS overcount regression (num_frames
+ * too high -> shifted indices, unreadable tail). Returns 0 on success. */
+static int check_cut_count(const uint8_t *base, size_t n, size_t coff) {
+	enum { CAP = 256 };
+	uint64_t bh[CAP], ch[CAP];
+	int bn = decode_hashes("cut-ref", base, n, bh, CAP);
+	int cn = decode_hashes("cut-count", base + coff, n - coff, ch, CAP);
+	if (bn < 0 || cn < 0) return 1;
+	if (cn == 0 || cn > bn) { printf("FAIL[cut]: cut has %d frames, full stream %d\n", cn, bn); return 1; }
+	int off = -1;
+	for (int i = 0; i <= bn - cn; i++)
+		if (ch[0] == bh[i]) { off = i; break; }
+	if (off < 0) { printf("FAIL[cut]: cut frame 0 matches no full-stream frame\n"); return 1; }
+	for (int i = 0; i < cn; i++)
+		if (ch[i] != bh[off + i]) {
+			printf("FAIL[cut]: frame %d is not full-stream frame %d "
+			       "(num_frames overcounted the pre-SPS/PPS slices?)\n", i, off + i);
+			return 1;
+		}
+	if (off + cn != bn) {
+		printf("FAIL[cut]: num_frames=%d ends at full-stream %d, not %d\n", cn, off + cn, bn);
+		return 1;
+	}
+	printf("ok[cut]: num_frames=%d = full-stream suffix [%d..%d], no pre-SPS/PPS overcount\n",
+	       cn, off, bn - 1);
+	return 0;
+}
+
 int main(int argc, char **argv) {
 	if (argc < 2) { fprintf(stderr, "usage: %s <base_multigop.264>\n", argv[0]); return 2; }
 	FILE *f = fopen(argv[1], "rb");
@@ -157,6 +240,14 @@ int main(int argc, char **argv) {
 	Buf ab = synth(base, (size_t)n, 1);   /* AUD-headed once -> P4-M-1 */
 	fail |= check_seek_consistency("aud_once", ab.p, ab.len);
 	free(ab.p);
+
+	/* mid-GOP cut: begins with VCL slices before any SPS/PPS (the Alba.264 case) */
+	size_t coff = mid_gop_cut_offset(base, (size_t)n);
+	if (!coff) { printf("FAIL[cut]: fixture has no post-IDR non-IDR access unit\n"); fail = 1; }
+	else {
+		fail |= check_cut_count(base, (size_t)n, coff);
+		fail |= check_seek_consistency("cut", base + coff, (size_t)n - coff);
+	}
 
 	free(base);
 	printf(fail ? "RESULT: FAIL\n" : "RESULT: PASS\n");
