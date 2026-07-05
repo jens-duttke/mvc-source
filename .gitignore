@@ -1,0 +1,24 @@
+# build artifacts
+/coretest
+/mockhost
+/mockhost-asan
+/seektest
+/enomemtest
+/allocfailtest
+/poctest
+*.o
+*.a
+*.so
+*.so.*
+*.dll
+*.dylib
+
+# local scratch / test outputs
+*.yuv
+*.y4m
+*.mp4
+/build/
+
+# local working artifacts (audit output, not part of the published plugin)
+/AUDIT/
+/AUDIT_REPORT.md

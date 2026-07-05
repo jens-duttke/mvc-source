@@ -1,0 +1,83 @@
+# Runs the vapoursynth-mvc test suite on every push / pull request, mirroring the
+# edge264 project's CI: build, then `make check`.
+#
+#   test         - builds the decode core + the plugin and exercises both through
+#                  the standalone core test and the mock VapourSynth API4 host
+#                  (no VapourSynth install needed).
+#   vapoursynth  - additionally builds a real VapourSynth runtime and loads the
+#                  built plugin with vspipe, the end-to-end proof.
+#
+# Both build edge264-mvc from source (statically linked into the plugin) and use
+# an MVC conformance fixture from the cloned edge264 tree as the test stream.
+name: Tests
+
+on:
+  push:
+    paths-ignore: [".gitignore", "LICENSE", "README.md"]
+  pull_request:
+    paths-ignore: [".gitignore", "LICENSE", "README.md"]
+
+env:
+  # edge264-mvc ref to build against; pinned to a release tag for reproducibility
+  # (git clone --depth 1 --branch accepts tags/branches but NOT commit SHAs, so a
+  # tag is required here). Bump when validating against a newer edge264-mvc.
+  EDGE264_REF: v2026.07.04-3
+  TEST_FILE: ../edge264/tests/conformance/mvc/MVCDS-4.264
+
+jobs:
+  test:
+    name: Core + plugin (mock VapourSynth host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch edge264-mvc
+        run: git clone --depth 1 --branch "$EDGE264_REF" https://github.com/jens-duttke/edge264-mvc ../edge264
+      - name: Build and run the test suite
+        run: make check TEST_FILE="$TEST_FILE"
+
+  vapoursynth:
+    name: Real VapourSynth runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch edge264-mvc
+        run: git clone --depth 1 --branch "$EDGE264_REF" https://github.com/jens-duttke/edge264-mvc ../edge264
+      - name: Install VapourSynth build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build nasm python3-dev libzimg-dev pkg-config
+          # Ubuntu's Cython is too old for Python 3.12 (generates code that fails
+          # to compile: "'digits' was not declared"); use a current one.
+          python3 -m pip install --user --break-system-packages -U 'Cython>=3.0.11'
+      - name: Build and install VapourSynth
+        run: |
+          # Pinned to the release the plugin was validated against (Core R77);
+          # bump the tag when re-validating against a newer VapourSynth.
+          git clone --depth 1 --branch R77 https://github.com/vapoursynth/vapoursynth /tmp/vapoursynth
+          cd /tmp/vapoursynth
+          export PATH="$HOME/.local/bin:$PATH"
+          meson setup build --prefix=/usr/local -Dbuildtype=release
+          ninja -C build
+          sudo ninja -C build install
+          sudo ldconfig
+          python3 -m vapoursynth config
+      - name: Build the plugin
+        run: make libvsmvc.so
+      - name: Load the plugin in vspipe (base + right + T&B)
+        run: |
+          vspipe --version
+          vspipe -a plugin="$PWD/libvsmvc.so" -a source="$TEST_FILE" -a stack=base  tests/test.vpy /dev/null
+          vspipe -a plugin="$PWD/libvsmvc.so" -a source="$TEST_FILE" -a stack=right tests/test.vpy /dev/null
+          vspipe -a plugin="$PWD/libvsmvc.so" -a source="$TEST_FILE" -a stack=tab   tests/test.vpy /dev/null
+      - name: Bit-exact vs edge264 through vspipe (regenerated reference)
+        run: |
+          sudo apt-get install -y ffmpeg
+          make -C ../edge264 STATIC=yes BUILDTEST=no edge264_test
+          N=5   # keep in sync with the Makefile's BITEXACT_FRAME
+          plugin=$(mktemp); ref=$(mktemp); trap 'rm -f "$plugin" "$ref"' EXIT
+          vspipe -s $N -e $N -a plugin="$PWD/libvsmvc.so" -a source="$TEST_FILE" -a stack=base tests/test.vpy "$plugin"
+          # shared reference-extraction, same script the Makefile's check-bitexact uses
+          sh tests/mkref.sh ../edge264/edge264_test "$TEST_FILE" $N "$ref"
+          a=$(md5sum < "$plugin"); b=$(md5sum < "$ref")
+          echo "plugin (vspipe): $a"; echo "edge264 ref:     $b"
+          [ "$a" = "$b" ] && echo "bit-exact: OK" || { echo "bit-exact: MISMATCH"; exit 1; }
