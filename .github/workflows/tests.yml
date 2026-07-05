@@ -78,16 +78,16 @@ jobs:
       - name: Load the plugin in vspipe (base + right + T&B)
         run: |
           vspipe --version
-          vspipe -a plugin="$PWD/libvsmvc.so" -a source="$TEST_FILE" -a stack=base  tests/test.vpy /dev/null
-          vspipe -a plugin="$PWD/libvsmvc.so" -a source="$TEST_FILE" -a stack=right tests/test.vpy /dev/null
-          vspipe -a plugin="$PWD/libvsmvc.so" -a source="$TEST_FILE" -a stack=tab   tests/test.vpy /dev/null
+          vspipe -a plugin="$PWD/libvsmvc.so" -a source="$PWD/$TEST_FILE" -a stack=base  tests/test.vpy /dev/null
+          vspipe -a plugin="$PWD/libvsmvc.so" -a source="$PWD/$TEST_FILE" -a stack=right tests/test.vpy /dev/null
+          vspipe -a plugin="$PWD/libvsmvc.so" -a source="$PWD/$TEST_FILE" -a stack=tab   tests/test.vpy /dev/null
       - name: Bit-exact vs edge264 through vspipe (regenerated reference)
         run: |
           sudo apt-get install -y ffmpeg
           make -C ../edge264 STATIC=yes BUILDTEST=no edge264_test
           N=5   # keep in sync with the Makefile's BITEXACT_FRAME
           plugin=$(mktemp); ref=$(mktemp); trap 'rm -f "$plugin" "$ref"' EXIT
-          vspipe -s $N -e $N -a plugin="$PWD/libvsmvc.so" -a source="$TEST_FILE" -a stack=base tests/test.vpy "$plugin"
+          vspipe -s $N -e $N -a plugin="$PWD/libvsmvc.so" -a source="$PWD/$TEST_FILE" -a stack=base tests/test.vpy "$plugin"
           # shared reference-extraction, same script the Makefile's check-bitexact uses
           sh tests/mkref.sh ../edge264/edge264_test "$TEST_FILE" $N "$ref"
           a=$(md5sum < "$plugin"); b=$(md5sum < "$ref")
