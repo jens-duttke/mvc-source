@@ -56,11 +56,23 @@ jobs:
           git clone --depth 1 --branch R77 https://github.com/vapoursynth/vapoursynth /tmp/vapoursynth
           cd /tmp/vapoursynth
           export PATH="$HOME/.local/bin:$PATH"
-          meson setup build --prefix=/usr/local -Dbuildtype=release
+          # -Dpython.bytecompile=-1: skip meson's post-install byte-compile step. It
+          # runs the interpreter against the just-installed vapoursynth module, which
+          # is not importable during install (its dist-packages dir is off Ubuntu's
+          # default sys.path and libvapoursynth is not yet in the linker cache), so it
+          # aborts the install otherwise.
+          meson setup build --prefix=/usr/local -Dbuildtype=release -Dpython.bytecompile=-1
           ninja -C build
           sudo ninja -C build install
           sudo ldconfig
-          python3 -m vapoursynth config
+          # VapourSynth installs its Python module, vspipe and shared lib under
+          # <prefix>/lib/python3/dist-packages/vapoursynth - none of which Ubuntu puts
+          # on the default search paths. Expose them for this and all later steps.
+          VSMOD=/usr/local/lib/python3/dist-packages
+          echo "PYTHONPATH=$VSMOD" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$VSMOD/vapoursynth" >> "$GITHUB_ENV"
+          echo "$VSMOD/vapoursynth" >> "$GITHUB_PATH"
+          PYTHONPATH="$VSMOD" LD_LIBRARY_PATH="$VSMOD/vapoursynth" python3 -m vapoursynth config
       - name: Build the plugin
         run: make libvsmvc.so
       - name: Load the plugin in vspipe (base + right + T&B)
