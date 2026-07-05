@@ -76,5 +76,5 @@ make EDGE264_SRC=/path/to/edge264-mvc          # builds the decode core + tests
 
 ## License
 
-BSD-3-Clause (see `LICENSE`). Statically links edge264-mvc (BSD-3-Clause) and
+BSD-3-Clause (see [LICENSE](LICENSE)). Statically links edge264-mvc (BSD-3-Clause) and
 builds against the VapourSynth SDK headers (LGPL-2.1-or-later).
