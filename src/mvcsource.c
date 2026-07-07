@@ -8,10 +8,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+#else
+  #include <fcntl.h>
+  #include <sys/mman.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+#endif
 
 #include "edge264.h"
 
@@ -28,7 +33,7 @@ typedef struct { const uint8_t *nal; int frame; } SeekPoint;
 typedef struct { const uint8_t *nal, *end; } ParamNal;
 
 struct MvcSource {
-	uint8_t *map;          /* mmap base (or NULL if malloc'd) */
+	uint8_t *map;          /* mapped file base (see map_file_ro), or NULL */
 	size_t map_size;
 	const uint8_t *start;  /* first NAL (past the leading start code) */
 	const uint8_t *end;    /* one past the last byte */
@@ -61,6 +66,52 @@ struct MvcSource {
 
 static void set_err(char *err, size_t n, const char *msg) {
 	if (err && n) { snprintf(err, n, "%s", msg); }
+}
+
+/* --- read-only file mapping (platform shim) ------------------------------- */
+
+/* Map `path` read-only into memory; returns the base pointer (with *size set) or
+ * NULL on failure (open error, or a file too short to hold a start code). Both
+ * backends map lazily - a multi-GB .264 is paged in on demand, not read into RAM
+ * up front - so the core's linear NAL scan and random-access seeks stay cheap. */
+static uint8_t *map_file_ro(const char *path, size_t *size) {
+#ifdef _WIN32
+	HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hf == INVALID_HANDLE_VALUE) return NULL;
+	LARGE_INTEGER sz;
+	if (!GetFileSizeEx(hf, &sz) || sz.QuadPart < 4) { CloseHandle(hf); return NULL; }
+	HANDLE hm = CreateFileMappingA(hf, NULL, PAGE_READONLY, 0, 0, NULL);
+	CloseHandle(hf); /* the mapping object holds its own reference to the file */
+	if (!hm) return NULL;
+	void *p = MapViewOfFile(hm, FILE_MAP_READ, 0, 0, 0);
+	CloseHandle(hm); /* the view keeps the file mapped until UnmapViewOfFile */
+	if (!p) return NULL;
+	*size = (size_t)sz.QuadPart;
+	return (uint8_t *)p;
+#else
+	int fd = open(path, O_RDONLY);
+	struct stat st;
+	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < 4) {
+		if (fd >= 0) close(fd);
+		return NULL;
+	}
+	void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	close(fd); /* the mapping survives closing the fd */
+	if (p == MAP_FAILED) return NULL;
+	*size = (size_t)st.st_size;
+	return (uint8_t *)p;
+#endif
+}
+
+static void unmap_file(uint8_t *p, size_t size) {
+	if (!p) return;
+#ifdef _WIN32
+	(void)size; /* UnmapViewOfFile takes only the base address */
+	UnmapViewOfFile(p);
+#else
+	munmap(p, size);
+#endif
 }
 
 /* --- NAL scan (indexing) -------------------------------------------------- */
@@ -314,19 +365,9 @@ MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swapl
 	s->n_threads = n_threads;
 	s->swaplr = swaplr != 0;
 
-	int fd = open(path, O_RDONLY);
-	struct stat st;
-	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < 4) {
+	s->map = map_file_ro(path, &s->map_size);
+	if (!s->map) {
 		set_err(err, errsize, "cannot open input file");
-		if (fd >= 0) close(fd);
-		free(s);
-		return NULL;
-	}
-	s->map_size = (size_t)st.st_size;
-	s->map = mmap(NULL, s->map_size, PROT_READ, MAP_SHARED, fd, 0);
-	close(fd);
-	if (s->map == MAP_FAILED) {
-		set_err(err, errsize, "cannot mmap input file");
 		free(s);
 		return NULL;
 	}
@@ -447,6 +488,6 @@ void mvc_close(MvcSource *s) {
 	if (s->dec) edge264_free(&s->dec);
 	free(s->idx);
 	free(s->ps);
-	if (s->map && s->map != MAP_FAILED) munmap(s->map, s->map_size);
+	unmap_file(s->map, s->map_size);
 	free(s);
 }

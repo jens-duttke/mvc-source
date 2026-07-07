@@ -22,9 +22,13 @@ CXXFLAGS  ?= -O2 -std=gnu++17 -Wall -Wextra
 EDGE264_SRC ?= ../edge264
 
 EDGE264_A := $(EDGE264_SRC)/libedge264.a
+# Extra args passed to the edge264 sub-make; set OS=windows (+ a MinGW CC) for a
+# Windows cross-build, e.g. EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc".
+EDGE264_MAKE ?=
 INCLUDES  := -Isrc -I$(EDGE264_SRC) -Iinclude
 PLUGIN    := libvsmvc.so
 AVS_PLUGIN := libavsmvc.so
+AVS_DLL   := libavsmvc.dll
 
 .PHONY: all clean check check-bitexact check-avs
 all: coretest mockhost seektest enomemtest allocfailtest poctest $(PLUGIN) $(AVS_PLUGIN)
@@ -34,7 +38,7 @@ all: coretest mockhost seektest enomemtest allocfailtest poctest $(PLUGIN) $(AVS
 # treated as up to date once it exists, which would link a stale .a after the
 # edge264 tree changes (a git pull / edit). The sub-make is fast when idle.
 $(EDGE264_A): FORCE
-	$(MAKE) -C $(EDGE264_SRC) STATIC=yes BUILDTEST=no
+	$(MAKE) -C $(EDGE264_SRC) STATIC=yes BUILDTEST=no $(EDGE264_MAKE)
 
 FORCE: ;
 
@@ -57,9 +61,32 @@ $(AVS_PLUGIN): src/avisynth_plugin.cpp src/mvcsource.c src/mvcsource.h $(EDGE264
 	    -Wl,--exclude-libs,ALL -o $@
 	rm -f src/mvcsource.avs.o
 
+# Windows cross-build of the AviSynth+ plugin (.dll). Invoke with the MinGW-w64
+# toolchain and a Windows edge264 build, e.g.:
+#   make libavsmvc.dll CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
+#        EDGE264_SRC=/path/to/edge264-win \
+#        EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+# On Windows the export is driven by __declspec(dllexport) (avisynth_plugin.cpp),
+# so only AvisynthPluginInit3 leaves the DLL and edge264 stays hidden. The
+# -static* flags link libgcc/libstdc++/winpthread in, so the .dll depends only on
+# KERNEL32/msvcrt - no MinGW runtime needed at load time. No -fPIC/-fvisibility
+# (those are POSIX shared-object semantics; Windows uses __declspec instead).
+$(AVS_DLL): src/avisynth_plugin.cpp src/mvcsource.c src/mvcsource.h $(EDGE264_A)
+	$(CC) $(CFLAGS) $(INCLUDES) -c src/mvcsource.c -o src/mvcsource.win.o
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -shared \
+	    src/avisynth_plugin.cpp src/mvcsource.win.o $(EDGE264_A) \
+	    -static -static-libgcc -static-libstdc++ -pthread -o $@
+	rm -f src/mvcsource.win.o
+
 # Standalone decode-core test (no VapourSynth needed).
 coretest: tests/coretest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 	$(CC) $(CFLAGS) $(INCLUDES) tests/coretest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
+
+# Windows cross-build of the core test (statically linked PE), for exercising the
+# Windows I/O shim under Wine (CI) or Windows without an AviSynth+ install. Built
+# with the same MinGW invocation as libavsmvc.dll (CC/EDGE264_SRC/EDGE264_MAKE).
+coretest.exe: tests/coretest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
+	$(CC) $(CFLAGS) $(INCLUDES) tests/coretest.c src/mvcsource.c $(EDGE264_A) -static -pthread -o $@
 
 # Mock VapourSynth API4 host that dlopens the plugin and drives it end-to-end.
 mockhost: tests/mockhost.c
@@ -182,4 +209,5 @@ endif
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264: OK" || { echo "MISMATCH"; exit 1; }
 
 clean:
-	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest avshost $(PLUGIN) $(AVS_PLUGIN) src/*.o
+	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest avshost \
+	    $(PLUGIN) $(AVS_PLUGIN) $(AVS_DLL) *.exe src/*.o

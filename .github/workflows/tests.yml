@@ -8,10 +8,14 @@
 #                  built plugin with vspipe, the end-to-end proof.
 #   avisynth     - builds a real AviSynth+ runtime and loads the built AviSynth+
 #                  plugin through its C API, the end-to-end proof for that glue.
+#   windows-cross- cross-compiles both the plugin DLL and the core test with
+#                  MinGW-w64, verifies the DLL's exports, and runs the Windows
+#                  core under Wine bit-exact vs an edge264 reference (proves the
+#                  Win32 file-mapping I/O shim decodes identically).
 #
 # All build edge264-mvc from source (statically linked into the plugins) and use
 # an MVC conformance fixture from the cloned edge264 tree as the test stream. The
-# vapoursynth and avisynth jobs both bit-exact-verify their glue against an
+# vapoursynth, avisynth and windows-cross jobs each bit-exact-verify against an
 # edge264 reference regenerated in the run.
 name: Tests
 
@@ -128,3 +132,47 @@ jobs:
           # reference regenerated in the run - so bit-exactness is CI-gated here too.
           sudo apt-get update && sudo apt-get install -y ffmpeg
           make check-avs TEST_FILE="$TEST_FILE"
+
+  windows-cross:
+    name: Windows cross-build (MinGW) + core bit-exact via Wine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch edge264-mvc
+        run: git clone --depth 1 --branch "$EDGE264_REF" https://github.com/jens-duttke/edge264-mvc ../edge264
+      - name: Install MinGW-w64, Wine and ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 wine64 ffmpeg
+      - name: Linux edge264_test (generates the bit-exact reference)
+        run: make -C ../edge264 STATIC=yes BUILDTEST=no edge264_test
+      - name: Cross-build edge264 for Windows (separate tree)
+        run: |
+          # a separate tree so the Windows objects do not clobber the Linux
+          # edge264_test built above (same object/.a names per OS).
+          cp -r ../edge264 ../edge264-win
+          make -C ../edge264-win clean
+          make -C ../edge264-win OS=windows CC=x86_64-w64-mingw32-gcc STATIC=yes BUILDTEST=no
+      - name: Cross-build the plugin DLL and verify its exports
+        run: |
+          make libavsmvc.dll CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
+            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+          file libavsmvc.dll
+          x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -A2 "Ordinal/Name Pointer"
+          # exactly AvisynthPluginInit3 is exported and no edge264 symbol leaks
+          x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -q "] AvisynthPluginInit3"
+          test "$(x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -c -i edge264)" = "0"
+      - name: Windows core bit-exact via Wine (proves the Win32 I/O shim)
+        run: |
+          make coretest.exe CC=x86_64-w64-mingw32-gcc \
+            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+          export WINEDEBUG=-all
+          # a relative path in the CWD (Wine maps the working dir to a drive letter),
+          # the path form validated locally via the WSL Windows-interop run.
+          N=5
+          cp "$TEST_FILE" ./win_input.264
+          wine coretest.exe win_input.264 0 $N win_frame.yuv
+          sh tests/mkref.sh ../edge264/edge264_test win_input.264 $N ref_frame.yuv
+          a=$(md5sum < win_frame.yuv); b=$(md5sum < ref_frame.yuv)
+          echo "windows core (wine): $a"; echo "edge264 ref:         $b"
+          [ "$a" = "$b" ] && echo "Windows core bit-exact: OK" || { echo "MISMATCH"; exit 1; }

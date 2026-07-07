@@ -12,7 +12,7 @@ these frameservers on Linux**. FFmpeg drops the MVC dependent view entirely, and
 the existing options (DGMVCsourceVS, FRIMSource) are Windows-only and pull in
 `libmfxsw64.dll`. `mvc-source` decodes both views in pure, self-contained C:
 edge264 is statically linked, so each built plugin is a single shared library
-with no external runtime dependency.
+(`.so` on Linux, `.dll` on Windows) with no external runtime dependency.
 
 Intended workflow: decode a 3D Blu-ray's MVC stream, frame-serve the two views
 (e.g. as a top-and-bottom clip), interpolate (e.g. with
@@ -32,9 +32,13 @@ both hosts** (correct frame count, dimensions, frame-accurate seeking).
 - [x] **AviSynth+ glue** (`src/avisynth_plugin.cpp`) - the `MVCSource` filter.
   Loaded through a real AviSynth+ runtime by `tests/avshost.c` (its C API) and
   confirmed bit-exact there (AviSynth+ 3.7.3).
+- [x] **Windows build** - both plugins cross-compile with MinGW-w64 to a
+  self-contained `.dll` (only `AvisynthPluginInit3` exported; depends on nothing
+  but `KERNEL32`/`msvcrt`). The Windows I/O path (a Win32 file mapping in place
+  of `mmap`) is **bit-exact-verified** via the core test under Wine. Loading the
+  `.dll` inside a Windows AviSynth+ host is the natural final validation - the
+  glue itself is platform-independent C++ and already bit-exact on Linux.
 - [ ] VUI frame-rate auto-detection; on-disk index cache for fast reopening.
-- [ ] Native Windows build (the core currently uses POSIX `mmap`/`open`; a small
-  I/O shim would let the same plugins build for Windows hosts).
 
 ## Usage
 
@@ -92,6 +96,24 @@ make EDGE264_SRC=/path/to/edge264-mvc     # builds both plugins + the core tests
 Individual targets: `make libvsmvc.so` (VapourSynth), `make libavsmvc.so`
 (AviSynth+). Tested on Linux; CI builds and bit-exact-verifies both plugins
 against edge264-mvc `v2026.07.07` and AviSynth+ `v3.7.3`.
+
+### Windows cross-build (MinGW-w64)
+
+The AviSynth+ plugin cross-compiles from Linux to a self-contained Windows `.dll`
+(needs `gcc-mingw-w64-x86-64` and `g++-mingw-w64-x86-64`):
+
+```sh
+# edge264 for Windows - a separate tree keeps its objects apart from a Linux build:
+cp -r ../edge264 ../edge264-win && make -C ../edge264-win clean
+make -C ../edge264-win OS=windows CC=x86_64-w64-mingw32-gcc STATIC=yes BUILDTEST=no
+# the plugin DLL:
+make libavsmvc.dll CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
+    EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+```
+
+The `windows-cross` CI job runs exactly this, then checks the DLL's exports and
+runs the core under Wine bit-exact vs an edge264 reference. `make coretest.exe`
+(same MinGW flags) builds the standalone core test as a Windows binary.
 
 ## Testing
 
