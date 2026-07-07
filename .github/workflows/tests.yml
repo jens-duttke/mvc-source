@@ -119,7 +119,14 @@ jobs:
           # installing to /usr/local + ldconfig puts it on the default search path.
           git clone --depth 1 --branch "$AVSPLUS_REF" https://github.com/AviSynth/AviSynthPlus /tmp/avsplus
           cd /tmp/avsplus
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+          # AviSynth+ autoloads every plugin in its plugin dirs on the first
+          # LoadPlugin, and the bundled shibatch's init segfaults in this headless
+          # build. Our host loads the plugin explicitly, so we don't need the bundled
+          # plugins: ENABLE_PLUGINS=OFF leaves the system plugin dir empty, and
+          # pointing the configurable user plugin dir at that same empty dir stops it
+          # defaulting to $HOME/.local/lib/avisynth (which could autoload a stray one).
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DENABLE_PLUGINS=OFF -DUSER_AVS_PLUGINDIR_LOCATION=/usr/local/lib/avisynth
           cmake --build build -j"$(nproc)"
           sudo cmake --install build
           sudo ldconfig
