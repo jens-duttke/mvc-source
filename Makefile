@@ -1,9 +1,9 @@
-# vapoursynth-mvc - a VapourSynth source plugin (and reusable decode core) for
-# H.264/AVC and MVC (3D) built on the edge264-mvc decoder.
+# mvc-source - VapourSynth and AviSynth+ source plugins (over one reusable decode
+# core) for H.264/AVC and MVC (3D) built on the edge264-mvc decoder.
 #
-# edge264 is statically linked, so the resulting plugin (libvsmvc.so) has no
-# external runtime dependency - exactly what a "no dependencies on Linux" MVC
-# source needs.
+# edge264 is statically linked, so each resulting plugin (libvsmvc.so for
+# VapourSynth, libavsmvc.so for AviSynth+) has no external runtime dependency -
+# exactly what a "no dependencies on Linux" MVC source needs.
 #
 # Parameters:
 #   EDGE264_SRC  path to an edge264-mvc source tree (default: ../edge264).
@@ -12,18 +12,22 @@
 #   CC, CFLAGS   compiler and flags.
 
 CC        ?= cc
+CXX       ?= c++
 # Preference flags only (a user/CI CFLAGS override replaces these). The
 # semantically-required -fPIC for the shared object lives in the $(PLUGIN) rule,
 # so an override cannot silently drop it.
 CFLAGS    ?= -O2 -std=gnu11 -Wall -Wextra
+# C++17 for the AviSynth+ glue: the vendored avisynth.h pulls in <filesystem>.
+CXXFLAGS  ?= -O2 -std=gnu++17 -Wall -Wextra
 EDGE264_SRC ?= ../edge264
 
 EDGE264_A := $(EDGE264_SRC)/libedge264.a
 INCLUDES  := -Isrc -I$(EDGE264_SRC) -Iinclude
 PLUGIN    := libvsmvc.so
+AVS_PLUGIN := libavsmvc.so
 
-.PHONY: all clean check check-bitexact
-all: coretest mockhost seektest enomemtest allocfailtest poctest $(PLUGIN)
+.PHONY: all clean check check-bitexact check-avs
+all: coretest mockhost seektest enomemtest allocfailtest poctest $(PLUGIN) $(AVS_PLUGIN)
 
 # edge264 as a self-contained static library. FORCE so the sub-make always runs
 # and decides up-to-dateness itself: a bare file target with no prerequisites is
@@ -41,6 +45,18 @@ $(PLUGIN): src/plugin.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 	    src/plugin.c src/mvcsource.c $(EDGE264_A) -pthread \
 	    -Wl,--exclude-libs,ALL -o $@
 
+# The AviSynth+ plugin: the same decode core plus a C++ IClip glue. mvcsource.c
+# must be compiled as C (it uses C-only idioms g++ would reject), so it is built
+# to an object with CC and linked against the C++ glue by CXX. As with the
+# VapourSynth plugin, only the host entry point (AvisynthPluginInit3) is exported
+# and edge264's statically-linked symbols are hidden.
+$(AVS_PLUGIN): src/avisynth_plugin.cpp src/mvcsource.c src/mvcsource.h $(EDGE264_A)
+	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden $(INCLUDES) -c src/mvcsource.c -o src/mvcsource.avs.o
+	$(CXX) $(CXXFLAGS) -fPIC -fvisibility=hidden $(INCLUDES) -shared \
+	    src/avisynth_plugin.cpp src/mvcsource.avs.o $(EDGE264_A) -pthread \
+	    -Wl,--exclude-libs,ALL -o $@
+	rm -f src/mvcsource.avs.o
+
 # Standalone decode-core test (no VapourSynth needed).
 coretest: tests/coretest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 	$(CC) $(CFLAGS) $(INCLUDES) tests/coretest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
@@ -48,6 +64,20 @@ coretest: tests/coretest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 # Mock VapourSynth API4 host that dlopens the plugin and drives it end-to-end.
 mockhost: tests/mockhost.c
 	$(CC) $(CFLAGS) $(INCLUDES) tests/mockhost.c -ldl -o $@
+
+# End-to-end AviSynth+ host: loads the built plugin through a *real* AviSynth+
+# runtime via its C API (the counterpart to the VapourSynth vspipe run). Needs a
+# libavisynth to link/run against, so it is exercised by `make check-avs` and the
+# avisynth CI job - not by the AviSynth-free `make check`. Override AVS_LIBS to
+# point at an uninstalled build, e.g.
+#   make check-avs AVS_LIBS="-L$HOME/avsplus/build -lavisynth" \
+#        LD_LIBRARY_PATH=$HOME/avsplus/build TEST_FILE=movie.264
+# -Wno-missing-field-initializers: the vendored avisynth_c.h defines
+# `avs_void = {'v'}` (first field only) by design; the warning is the upstream
+# header's, not ours, so silence it just here rather than patch a vendored file.
+AVS_LIBS ?= -lavisynth
+avshost: tests/avshost.c
+	$(CC) $(CFLAGS) -Wno-missing-field-initializers $(INCLUDES) tests/avshost.c $(AVS_LIBS) -o $@
 
 # The same host under AddressSanitizer/LeakSanitizer, for the createVideoFilter-
 # failure cleanup check (the plugin's leak on that path is only observable here).
@@ -78,7 +108,7 @@ poctest: tests/poctest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264_get_frame \
 	    tests/poctest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
-check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest $(PLUGIN)
+check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest $(PLUGIN) $(AVS_PLUGIN)
 	@echo "== makefile behaviour (edge264 sub-make always delegated) =="
 	sh tests/mkcheck.sh "$(EDGE264_SRC)"
 	@echo "== seek regression (headerless-GOP / AUD-headed, committed fixture) =="
@@ -129,5 +159,27 @@ endif
 	  echo "core=$$a"; echo "ref =$$b"; \
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264: OK" || { echo "MISMATCH"; exit 1; }
 
+# Full end-to-end AviSynth+ check: load the built plugin through a real AviSynth+
+# runtime (properties, layouts, error paths), then bit-exact vs an edge264
+# reference regenerated on the fly - the same shared extraction check-bitexact
+# uses. Needs a libavisynth (see AVS_LIBS above), ffmpeg, and TEST_FILE.
+check-avs: $(AVS_PLUGIN) avshost
+ifndef TEST_FILE
+	@echo "set TEST_FILE=<file.264> to run the AviSynth+ check, e.g. make check-avs TEST_FILE=movie.264"
+	@exit 1
+endif
+	@echo "== AviSynth+ end-to-end (real runtime: properties, layouts, error paths) =="
+	./avshost ./$(AVS_PLUGIN) "$(TEST_FILE)" tab
+	@echo "== bit-exact vs edge264 through AviSynth+ =="
+	$(MAKE) -C $(EDGE264_SRC) STATIC=yes BUILDTEST=no edge264_test
+	@set -e; \
+	  avs=$$(mktemp); ref=$$(mktemp); \
+	  trap 'rm -f "$$avs" "$$ref"' EXIT; \
+	  ./avshost ./$(AVS_PLUGIN) "$(TEST_FILE)" base $(BITEXACT_FRAME) "$$avs"; \
+	  sh tests/mkref.sh "$(EDGE264_SRC)/edge264_test" "$(TEST_FILE)" $(BITEXACT_FRAME) "$$ref"; \
+	  a=$$(md5sum < "$$avs"); b=$$(md5sum < "$$ref"); \
+	  echo "avs (AviSynth+): $$a"; echo "edge264 ref:     $$b"; \
+	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264: OK" || { echo "MISMATCH"; exit 1; }
+
 clean:
-	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest $(PLUGIN) src/*.o
+	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest avshost $(PLUGIN) $(AVS_PLUGIN) src/*.o

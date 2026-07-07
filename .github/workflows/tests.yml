@@ -1,14 +1,18 @@
 # Runs the vapoursynth-mvc test suite on every push / pull request, mirroring the
 # edge264 project's CI: build, then `make check`.
 #
-#   test         - builds the decode core + the plugin and exercises both through
-#                  the standalone core test and the mock VapourSynth API4 host
-#                  (no VapourSynth install needed).
+#   test         - builds the decode core + both plugins and exercises the core
+#                  and the VapourSynth glue through the standalone core test and
+#                  the mock VapourSynth API4 host (no host install needed).
 #   vapoursynth  - additionally builds a real VapourSynth runtime and loads the
 #                  built plugin with vspipe, the end-to-end proof.
+#   avisynth     - builds a real AviSynth+ runtime and loads the built AviSynth+
+#                  plugin through its C API, the end-to-end proof for that glue.
 #
-# Both build edge264-mvc from source (statically linked into the plugin) and use
-# an MVC conformance fixture from the cloned edge264 tree as the test stream.
+# All build edge264-mvc from source (statically linked into the plugins) and use
+# an MVC conformance fixture from the cloned edge264 tree as the test stream. The
+# vapoursynth and avisynth jobs both bit-exact-verify their glue against an
+# edge264 reference regenerated in the run.
 name: Tests
 
 on:
@@ -22,6 +26,9 @@ env:
   # (git clone --depth 1 --branch accepts tags/branches but NOT commit SHAs, so a
   # tag is required here). Bump when validating against a newer edge264-mvc.
   EDGE264_REF: v2026.07.07
+  # AviSynth+ release to build the avisynth job against; pinned for reproducibility
+  # and kept in sync with the vendored include/avisynth*.h headers. Bump both together.
+  AVSPLUS_REF: v3.7.3
   TEST_FILE: ../edge264/tests/conformance/mvc/MVCDS-4.264
 
 jobs:
@@ -93,3 +100,31 @@ jobs:
           a=$(md5sum < "$plugin"); b=$(md5sum < "$ref")
           echo "plugin (vspipe): $a"; echo "edge264 ref:     $b"
           [ "$a" = "$b" ] && echo "bit-exact: OK" || { echo "bit-exact: MISMATCH"; exit 1; }
+
+  avisynth:
+    name: Real AviSynth+ runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch edge264-mvc
+        run: git clone --depth 1 --branch "$EDGE264_REF" https://github.com/jens-duttke/edge264-mvc ../edge264
+      - name: Build and install AviSynth+
+        run: |
+          # Pinned to AVSPLUS_REF (kept in sync with the vendored avisynth*.h). The
+          # core library (libavisynth.so) is all the plugin + host link/run against;
+          # installing to /usr/local + ldconfig puts it on the default search path.
+          git clone --depth 1 --branch "$AVSPLUS_REF" https://github.com/AviSynth/AviSynthPlus /tmp/avsplus
+          cd /tmp/avsplus
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build build -j"$(nproc)"
+          sudo cmake --install build
+          sudo ldconfig
+      - name: Build the AviSynth+ plugin
+        run: make libavsmvc.so
+      - name: Load in a real AviSynth+ and bit-exact vs edge264 (regenerated reference)
+        run: |
+          # check-avs loads the plugin through a real AviSynth+ (properties, all
+          # layouts, error paths), then md5-compares one frame against an edge264
+          # reference regenerated in the run - so bit-exactness is CI-gated here too.
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          make check-avs TEST_FILE="$TEST_FILE"

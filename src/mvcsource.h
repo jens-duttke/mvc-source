@@ -1,12 +1,12 @@
 /*
- * mvcsource - VapourSynth-independent H.264/MVC decode core built on edge264-mvc.
+ * mvcsource - host-independent H.264/MVC decode core built on edge264-mvc.
  *
  * Opens an Annex-B .264/.h264 elementary stream (2D or MVC 3D), exposes the
  * stream properties (dimensions, frame count) and serves any output frame by
  * display index, optionally combining the two MVC views into one frame
  * (top-and-bottom or side-by-side). All the real logic - the edge264 caller
  * loop, seeking and view assembly - lives here so it can be tested without a
- * VapourSynth runtime; the VapourSynth glue is a thin wrapper on top.
+ * frameserver runtime; the VapourSynth and AviSynth+ glues are thin wrappers on top.
  *
  * Copyright (c) 2026 Jens Duttke. BSD-3-Clause (see LICENSE).
  */

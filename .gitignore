@@ -2,6 +2,7 @@
 /coretest
 /mockhost
 /mockhost-asan
+/avshost
 /seektest
 /enomemtest
 /allocfailtest
