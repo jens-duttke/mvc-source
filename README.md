@@ -84,7 +84,7 @@ the VUI rate); the default is 24000/1001.
 
 ## Building
 
-Requires a C/C++ compiler and an
+Requires a C compiler and an
 [edge264-mvc](https://github.com/jens-duttke/edge264-mvc) source tree (pin a
 release tag for reproducible builds). The VapourSynth API4 and AviSynth+ SDK
 headers are vendored under `include/`, so no host install is needed to build.
