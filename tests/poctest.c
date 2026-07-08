@@ -5,8 +5,8 @@
  * that the decoder emits exactly the pictures scan_index counted, in display
  * order. If that invariant ever breaks - a dropped/duplicated picture, a reorder
  * bug, decoder drift on a version bump - every later frame is served under the
- * wrong index, silently. The core now verifies DisplayPoc strictly increases
- * across a decode run and fails loudly on a violation.
+ * wrong index, silently. The source now verifies DisplayPoc never decreases
+ * across a decode run and fails loudly on a backward step.
  *
  * edge264_get_frame is intercepted via the linker's --wrap so one output's
  * DisplayPoc is forced non-monotone, standing in for any such divergence.

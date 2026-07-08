@@ -210,14 +210,19 @@ static void scan_index(MvcSource *s) {
  * every later display index - fail loudly instead.
  */
 /* Tripwire for the "blind output count == scan count" invariant: the decoder
- * emits pictures in strictly increasing display order within a run, so a
- * DisplayPoc that fails to advance means the output stream has diverged from
- * what scan_index counted (a dropped/duplicated picture or decoder drift) and
- * every later frame would be mislabeled. Fail loudly instead. Returns 1 on
- * success, 0 on a divergence (err set); last_poc is INT64_MIN after a reset. */
+ * emits pictures in non-decreasing display order within a run (edge264 makes
+ * DisplayPoc a monotone display-order key), so a DisplayPoc that steps *backwards*
+ * means the output stream has diverged from what scan_index counted (a
+ * dropped/duplicated picture or decoder drift) and every later frame would be
+ * mislabeled. Fail loudly on a strict decrease. A plateau (equal DisplayPoc) is
+ * tolerated to match edge264's own conformance contract (conformance_check.c uses
+ * '<', not '<='): a legitimate open-GOP POC collision on a real 3D Blu-ray - two
+ * successive output pictures sharing a raw POC - must not abort an otherwise
+ * correct decode. Returns 1 on success, 0 on a divergence (err set); last_poc is
+ * INT64_MIN after a reset. */
 static int check_display_order(MvcSource *s, const Edge264Frame *out, char *err, size_t errsize) {
-	if (s->last_poc != INT64_MIN && out->DisplayPoc <= s->last_poc) {
-		set_err(err, errsize, "decoder output order diverged (display POC not increasing)");
+	if (s->last_poc != INT64_MIN && out->DisplayPoc < s->last_poc) {
+		set_err(err, errsize, "decoder output order diverged (display POC decreased)");
 		return 0;
 	}
 	s->last_poc = out->DisplayPoc;
