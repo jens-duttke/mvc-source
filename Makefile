@@ -29,6 +29,7 @@ INCLUDES  := -Isrc -I$(EDGE264_SRC) -Iinclude
 PLUGIN    := libvsmvc.so
 AVS_PLUGIN := libavsmvc.so
 AVS_DLL   := libavsmvc.dll
+VS_DLL    := libvsmvc.dll
 
 .PHONY: all clean check check-bitexact check-avs
 all: coretest mockhost seektest enomemtest allocfailtest poctest $(PLUGIN) $(AVS_PLUGIN)
@@ -81,6 +82,17 @@ $(AVS_DLL): src/avisynth_plugin.c src/mvcsource.c src/mvcsource.h src/avisynth_w
 	    src/avisynth_plugin.c src/mvcsource.c $(EDGE264_A) avisynth.dll.a \
 	    -static -static-libgcc -pthread -o $@
 	rm -f avisynth.dll.a
+
+# Windows cross-build of the VapourSynth plugin (.dll). Same MinGW invocation as
+# libavsmvc.dll (CC/EDGE264_SRC/EDGE264_MAKE). Unlike the AviSynth DLL the plugin
+# imports nothing from the host - VapourSynth passes its API into
+# VapourSynthPluginInit2 - so there is no import .def / dlltool step; the export
+# comes from VS_EXTERNAL_API's __declspec(dllexport) on Windows. -static* fold
+# libgcc/winpthread in, so the .dll depends only on KERNEL32/msvcrt.
+$(VS_DLL): src/plugin.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
+	$(CC) $(CFLAGS) $(INCLUDES) -shared \
+	    src/plugin.c src/mvcsource.c $(EDGE264_A) \
+	    -static -static-libgcc -pthread -o $@
 
 # Standalone decode-core test (no VapourSynth needed).
 coretest: tests/coretest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
@@ -214,4 +226,4 @@ endif
 
 clean:
 	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest avshost \
-	    $(PLUGIN) $(AVS_PLUGIN) $(AVS_DLL) *.exe src/*.o
+	    $(PLUGIN) $(AVS_PLUGIN) $(AVS_DLL) $(VS_DLL) *.exe src/*.o

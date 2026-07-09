@@ -162,7 +162,7 @@ jobs:
           cp -r ../edge264 ../edge264-win
           make -C ../edge264-win clean
           make -C ../edge264-win OS=windows CC=x86_64-w64-mingw32-gcc STATIC=yes BUILDTEST=no
-      - name: Cross-build the plugin DLL and verify its exports
+      - name: Cross-build both plugin DLLs and verify their exports
         run: |
           make libavsmvc.dll CC=x86_64-w64-mingw32-gcc DLLTOOL=x86_64-w64-mingw32-dlltool \
             EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
@@ -171,6 +171,12 @@ jobs:
           # exactly avisynth_c_plugin_init is exported and no edge264 symbol leaks
           x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -q "] avisynth_c_plugin_init"
           test "$(x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -c -i edge264)" = "0"
+          make libvsmvc.dll CC=x86_64-w64-mingw32-gcc DLLTOOL=x86_64-w64-mingw32-dlltool \
+            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+          file libvsmvc.dll
+          # exactly VapourSynthPluginInit2 is exported and no edge264 symbol leaks
+          x86_64-w64-mingw32-objdump -p libvsmvc.dll | grep -q "VapourSynthPluginInit2"
+          test "$(x86_64-w64-mingw32-objdump -p libvsmvc.dll | grep -c -i edge264)" = "0"
       - name: Windows core bit-exact via Wine (proves the Win32 I/O shim)
         run: |
           make coretest.exe CC=x86_64-w64-mingw32-gcc \

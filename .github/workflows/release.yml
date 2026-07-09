@@ -1,0 +1,65 @@
+# Builds the four distributable plugin binaries and attaches them to the GitHub
+# Release when a version tag (v*) is pushed:
+#   libvsmvc.so   - Linux   VapourSynth plugin
+#   libavsmvc.so  - Linux   AviSynth+  plugin
+#   libvsmvc.dll  - Windows VapourSynth plugin (MinGW cross-build)
+#   libavsmvc.dll - Windows AviSynth+  plugin (MinGW cross-build)
+# Each statically links edge264-mvc (pinned by EDGE264_REF) and has no external
+# runtime dependency beyond the host. The build commands mirror tests.yml, where
+# correctness is gated; this workflow only packages and publishes.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create/update the release and upload assets
+
+env:
+  # edge264-mvc release the binaries are built against. Keep in sync with
+  # tests.yml's EDGE264_REF; bump both to the matching edge264-mvc tag.
+  EDGE264_REF: v2026.07.09
+
+jobs:
+  release-binaries:
+    name: Build binaries and attach them to the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Fetch edge264-mvc
+        run: git clone --depth 1 --branch "$EDGE264_REF" https://github.com/jens-duttke/edge264-mvc ../edge264
+      - name: Build the Linux plugins (.so)
+        run: make libvsmvc.so libavsmvc.so
+      - name: Cross-build edge264-mvc for Windows (separate tree)
+        run: |
+          cp -r ../edge264 ../edge264-win
+          make -C ../edge264-win clean
+          make -C ../edge264-win OS=windows CC=x86_64-w64-mingw32-gcc STATIC=yes BUILDTEST=no
+      - name: Cross-build the Windows plugins (.dll)
+        run: |
+          make libvsmvc.dll  CC=x86_64-w64-mingw32-gcc DLLTOOL=x86_64-w64-mingw32-dlltool \
+            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+          make libavsmvc.dll CC=x86_64-w64-mingw32-gcc DLLTOOL=x86_64-w64-mingw32-dlltool \
+            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+      - name: Verify the Windows exports (only the plugin entry, no edge264 leak)
+        run: |
+          x86_64-w64-mingw32-objdump -p libvsmvc.dll  | grep -q "VapourSynthPluginInit2"
+          test "$(x86_64-w64-mingw32-objdump -p libvsmvc.dll  | grep -c -i edge264)" = "0"
+          x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -q "avisynth_c_plugin_init"
+          test "$(x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -c -i edge264)" = "0"
+      - name: Attach binaries to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="libvsmvc.so libavsmvc.so libvsmvc.dll libavsmvc.dll"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" $files --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" $files \
+              --title "$GITHUB_REF_NAME" --notes-from-tag --verify-tag
+          fi
