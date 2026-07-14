@@ -32,7 +32,7 @@ AVS_DLL   := libavsmvc.dll
 VS_DLL    := libvsmvc.dll
 
 .PHONY: all clean check check-bitexact check-avs
-all: coretest mockhost seektest enomemtest allocfailtest poctest $(PLUGIN) $(AVS_PLUGIN)
+all: coretest mockhost seektest enomemtest allocfailtest poctest cachetest $(PLUGIN) $(AVS_PLUGIN)
 
 # edge264 as a self-contained static library. FORCE so the sub-make always runs
 # and decides up-to-dateness itself: a bare file target with no prerequisites is
@@ -151,7 +151,12 @@ poctest: tests/poctest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264_get_frame \
 	    tests/poctest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
-check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest $(PLUGIN) $(AVS_PLUGIN)
+# On-disk index-cache regression: cache hit == fresh scan, and a corrupt / stale
+# sidecar is ignored rather than trusted. Committed fixture, no TEST_FILE.
+cachetest: tests/cachetest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
+	$(CC) $(CFLAGS) $(INCLUDES) tests/cachetest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
+
+check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest cachetest $(PLUGIN) $(AVS_PLUGIN)
 	@echo "== makefile behaviour (edge264 sub-make always delegated) =="
 	sh tests/mkcheck.sh "$(EDGE264_SRC)"
 	@echo "== seek regression (headerless-GOP / AUD-headed, committed fixture) =="
@@ -162,6 +167,8 @@ check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest
 	./allocfailtest tests/fixtures/base_multigop.264
 	@echo "== display-order tripwire (injected via --wrap) =="
 	./poctest tests/fixtures/base_multigop.264
+	@echo "== on-disk index cache (miss/hit + corrupt/stale, committed fixture) =="
+	./cachetest tests/fixtures/base_multigop.264
 	@echo "== test.vpy argument guards (stub VapourSynth) =="
 	python3 tests/vpycheck.py
 ifndef TEST_FILE
@@ -225,5 +232,5 @@ endif
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264: OK" || { echo "MISMATCH"; exit 1; }
 
 clean:
-	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest avshost \
+	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest cachetest avshost \
 	    $(PLUGIN) $(AVS_PLUGIN) $(AVS_DLL) $(VS_DLL) *.exe src/*.o

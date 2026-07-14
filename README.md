@@ -39,7 +39,29 @@ both hosts** (correct frame count, dimensions, frame-accurate seeking).
   imports only `KERNEL32`/`msvcrt`/`AviSynth.dll`). Verified **bit-exact in the
   official MSVC-built Windows AviSynth+ 3.7.3** end-to-end - both the Win32
   file-mapping I/O path and the C-interface glue.
-- [ ] VUI frame-rate auto-detection; on-disk index cache for fast reopening.
+- [x] **On-disk index cache** - a reopen of an unchanged stream skips the
+  full-file NAL scan (which must otherwise read the whole file to count frames):
+  the scan result is cached in a sidecar `<source>.mvcidx` next to the source,
+  keyed on the source's size + last-write time. Measured on a 1.4 GB MVC stream:
+  reopen dropped from a full-file scan to ~25 ms (the sidecar plus the first GOP),
+  bit-identical output. Writing is best-effort (a read-only directory simply
+  means no cache, never a failed open); a stale or corrupt sidecar is detected
+  and a fresh scan runs.
+- [x] **Fast random-access seeking** - seek points are recorded at every
+  random-access point: an IDR, or a non-IDR I picture that carries a
+  `recovery_point` SEI (recovery_frame_cnt 0), the exact open-GOP recovery point
+  Blu-ray uses for chapter/entry points. A plain non-IDR I picture is *not* a
+  seek point - later pictures may reference across it, so decoding from it would
+  return wrong frames (verified against the JVT 2D conformance set). Because
+  IDRs alone can be hundreds of frames apart (615 on a real 3D Blu-ray),
+  indexing recovery points cuts a seek to their spacing (~20 frames) instead of
+  a whole IDR GOP. A bounded decoded-frame cache (~128 MB, like BestSource's
+  `cachesize`) then serves backward / repeat / `Reverse()` access from RAM.
+  Measured on a 1.4 GB MVC stream: a near-end seek dropped from ~18 s to ~0.5 s,
+  backward-adjacent access to ~0.2 ms, and AviSynth `Reverse()` went from never
+  displaying a frame to ~35 fps single-threaded, bit-exact - while remaining
+  bit-exact on the full JVT conformance corpus.
+- [ ] VUI frame-rate auto-detection.
 
 ## Usage
 

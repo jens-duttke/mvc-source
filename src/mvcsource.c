@@ -32,6 +32,24 @@ typedef struct { const uint8_t *nal; int frame; } SeekPoint;
  * streams that carry the sets only once at the start do not repeat them per IDR. */
 typedef struct { const uint8_t *nal, *end; } ParamNal;
 
+/* A cached decoded source picture: an independent copy of the base (and, for
+ * MVC, the dependent) view's packed planes, plus an Edge264Frame view over that
+ * copy. Because the copy is independent of the decoder, it survives edge264_free
+ * (a seek) and lets backward / repeat access - the pathological case for a
+ * source filter, e.g. AviSynth Reverse() - hit RAM instead of re-decoding a GOP. */
+typedef struct {
+	int index;           /* source picture index held, or -1 if empty */
+	uint8_t *buf;        /* packed base [+ dependent] Y/U/V planes */
+	size_t bufcap;
+	Edge264Frame frame;  /* view over buf: samples/samples_mvc + packed strides */
+} FrameSlot;
+
+/* Decoded-frame cache budget: as many slots as fit ~128 MB (BestSource's
+ * cachesize default is 100 MB), so a whole I-frame span (~20 frames on a 3D
+ * Blu-ray) is cached and a Reverse() / backward pass decodes each span once. */
+#define FRAME_CACHE_BUDGET_BYTES (128u << 20)
+#define FRAME_CACHE_MAX_SLOTS 64
+
 struct MvcSource {
 	uint8_t *map;          /* mapped file base (see map_file_ro), or NULL */
 	size_t map_size;
@@ -54,14 +72,16 @@ struct MvcSource {
 	int next_out;          /* display index of the next frame get_frame will yield */
 	int64_t last_poc;      /* DisplayPoc of the previous output in this run (INT64_MIN after a reset) */
 
-	/* Last decoded source picture, cached so MVC_ALT emits both of its output
-	 * frames (the two views) from one decode. edge264_get_frame(borrow=0) frames
-	 * stay valid until the next edge264_decode_NAL, and a cache hit issues none;
-	 * a decoder reset (edge264_free) invalidates them, so cur_valid is cleared
-	 * there. cur_index is the source display index cur holds. */
+	/* Ring of recently decoded source pictures (independent copies), so backward /
+	 * repeat access serves from RAM instead of re-decoding. Sized once from the
+	 * first frame to the memory budget (ring_init). The copies survive a decoder
+	 * reset, so a seek that recreates the decoder does not invalidate them. cur is
+	 * the picture mvc_get_frame currently assembles from (a slot's view, or the
+	 * just-decoded borrowed frame if caching hit OOM). */
+	FrameSlot *slots;
+	int ring_cap;        /* number of slots (0 until ring_init) */
+	int ring_head;       /* round-robin insert position */
 	Edge264Frame cur;
-	int cur_valid;
-	int cur_index;
 };
 
 static void set_err(char *err, size_t n, const char *msg) {
@@ -73,14 +93,22 @@ static void set_err(char *err, size_t n, const char *msg) {
 /* Map `path` read-only into memory; returns the base pointer (with *size set) or
  * NULL on failure (open error, or a file too short to hold a start code). Both
  * backends map lazily - a multi-GB .264 is paged in on demand, not read into RAM
- * up front - so the core's linear NAL scan and random-access seeks stay cheap. */
-static uint8_t *map_file_ro(const char *path, size_t *size) {
+ * up front - so the core's linear NAL scan and random-access seeks stay cheap.
+ * *mtime is set to the file's last-write time (platform-native units) for use as
+ * an index-cache freshness key; its only requirement is that it changes when the
+ * file's contents change, and it is only ever compared against a value this same
+ * platform wrote earlier, so the differing Win32/POSIX epochs do not matter. */
+static uint8_t *map_file_ro(const char *path, size_t *size, int64_t *mtime) {
+	*mtime = 0;
 #ifdef _WIN32
 	HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
 		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (hf == INVALID_HANDLE_VALUE) return NULL;
 	LARGE_INTEGER sz;
+	FILETIME ftw;
 	if (!GetFileSizeEx(hf, &sz) || sz.QuadPart < 4) { CloseHandle(hf); return NULL; }
+	if (GetFileTime(hf, NULL, NULL, &ftw))
+		*mtime = ((int64_t)ftw.dwHighDateTime << 32) | ftw.dwLowDateTime;
 	HANDLE hm = CreateFileMappingA(hf, NULL, PAGE_READONLY, 0, 0, NULL);
 	CloseHandle(hf); /* the mapping object holds its own reference to the file */
 	if (!hm) return NULL;
@@ -96,6 +124,7 @@ static uint8_t *map_file_ro(const char *path, size_t *size) {
 		if (fd >= 0) close(fd);
 		return NULL;
 	}
+	*mtime = (int64_t)st.st_mtime;
 	void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
 	close(fd); /* the mapping survives closing the fd */
 	if (p == MAP_FAILED) return NULL;
@@ -114,7 +143,187 @@ static void unmap_file(uint8_t *p, size_t size) {
 #endif
 }
 
+/* --- on-disk index cache -------------------------------------------------- */
+
+/*
+ * scan_index reads the whole file once (it must, to find every VCL NAL and
+ * count the pictures), which on a large stream on a slow disk is the entire
+ * cost of opening - and it repeats on every reopen. This sidecar caches the
+ * scan result next to the source (`<source>.mvcidx`, the convention lsmash's
+ * `.lwi` established), keyed on the source's size + last-write time + a format
+ * magic, so a reopen of an unchanged file skips the scan entirely. Only the
+ * scan is cached, not decoding: mvc_open still decodes the first frame for exact
+ * dimensions (that touches one GOP, not the whole file). Writing is best-effort
+ * - a read-only directory just means no cache, never a failure to open - and a
+ * short/corrupt cache fails the size/mtime check and triggers a fresh scan.
+ * Machine-local artifact: written and read by the same build, so native field
+ * sizes/order are fine (the magic gates any future format change).
+ */
+#define MVCIDX_MAGIC "MVCIDX02" /* bump the trailing digits to invalidate old caches (02: seek points now include non-IDR I-frame RAPs) */
+
+struct idx_hdr {
+	char     magic[8];   /* MVCIDX_MAGIC, no NUL */
+	uint64_t src_size;
+	int64_t  src_mtime;
+	int32_t  num_pics;
+	int32_t  is_mvc;
+	int32_t  nidx;       /* seek points */
+	int32_t  nps;        /* parameter-set NALs */
+}; /* 40 bytes, naturally aligned: no padding */
+
+/* Load the cache at cpath into s (idx/ps/num_pics/is_mvc). Returns 1 only if the
+ * cache is present, well-formed and matches this exact source (size + mtime);
+ * any mismatch or I/O/format error returns 0 so the caller falls back to a
+ * scan. All stored offsets are validated to lie within the mapping before a
+ * pointer is formed, so a corrupt cache cannot point the decoder out of bounds. */
+static int load_index_cache(MvcSource *s, const char *cpath, uint64_t src_size, int64_t src_mtime) {
+	FILE *f = fopen(cpath, "rb");
+	if (!f) return 0;
+	struct idx_hdr h;
+	int ok = 0;
+	int64_t *ioff = NULL, *poff = NULL, *plen = NULL;
+	int32_t *ifr = NULL;
+	SeekPoint *idx = NULL;
+	ParamNal *ps = NULL;
+	if (fread(&h, sizeof h, 1, f) != 1)
+		goto done;
+	if (memcmp(h.magic, MVCIDX_MAGIC, 8) != 0 || h.src_size != src_size ||
+	    h.src_mtime != src_mtime || h.num_pics <= 0 || h.nidx < 0 || h.nps < 0)
+		goto done;
+	/* caps guard against a corrupt count forcing a huge allocation */
+	if (h.nidx > (1 << 28) || h.nps > (1 << 26))
+		goto done;
+	if (h.nidx) {
+		ioff = malloc((size_t)h.nidx * sizeof *ioff);
+		ifr = malloc((size_t)h.nidx * sizeof *ifr);
+		idx = malloc((size_t)h.nidx * sizeof *idx);
+		if (!ioff || !ifr || !idx) goto done;
+		if (fread(ioff, sizeof *ioff, h.nidx, f) != (size_t)h.nidx ||
+		    fread(ifr, sizeof *ifr, h.nidx, f) != (size_t)h.nidx) goto done;
+	}
+	if (h.nps) {
+		poff = malloc((size_t)h.nps * sizeof *poff);
+		plen = malloc((size_t)h.nps * sizeof *plen);
+		ps = malloc((size_t)h.nps * sizeof *ps);
+		if (!poff || !plen || !ps) goto done;
+		if (fread(poff, sizeof *poff, h.nps, f) != (size_t)h.nps ||
+		    fread(plen, sizeof *plen, h.nps, f) != (size_t)h.nps) goto done;
+	}
+	for (int i = 0; i < h.nidx; i++) {
+		if (ioff[i] < 0 || (uint64_t)ioff[i] >= src_size) goto done;
+		idx[i].nal = s->map + ioff[i];
+		idx[i].frame = ifr[i];
+	}
+	for (int i = 0; i < h.nps; i++) {
+		if (poff[i] < 0 || plen[i] < 0 || (uint64_t)poff[i] + (uint64_t)plen[i] > src_size) goto done;
+		ps[i].nal = s->map + poff[i];
+		ps[i].end = s->map + poff[i] + plen[i];
+	}
+	s->idx = idx; s->nidx = s->idxcap = h.nidx; idx = NULL; /* ownership transferred */
+	s->ps = ps; s->nps = s->pscap = h.nps; ps = NULL;
+	s->num_pics = h.num_pics;
+	s->info.is_mvc = h.is_mvc;
+	ok = 1;
+done:
+	free(ioff); free(ifr); free(poff); free(plen);
+	free(idx); free(ps); /* NULL after a successful transfer, so no double free */
+	fclose(f);
+	return ok;
+}
+
+/* Write s's scan result to cpath (best-effort). A failure to open (read-only
+ * media) is silently ignored; a write failure removes the partial file so a
+ * later open re-scans rather than trusting a truncated cache. */
+static void save_index_cache(const MvcSource *s, const char *cpath, uint64_t src_size, int64_t src_mtime) {
+	FILE *f = fopen(cpath, "wb");
+	if (!f) return;
+	struct idx_hdr h;
+	memset(&h, 0, sizeof h);
+	memcpy(h.magic, MVCIDX_MAGIC, 8);
+	h.src_size = src_size;
+	h.src_mtime = src_mtime;
+	h.num_pics = s->num_pics;
+	h.is_mvc = s->info.is_mvc;
+	h.nidx = s->nidx;
+	h.nps = s->nps;
+	int ok = fwrite(&h, sizeof h, 1, f) == 1;
+	for (int i = 0; i < s->nidx && ok; i++) { int64_t o = s->idx[i].nal - s->map; ok = fwrite(&o, sizeof o, 1, f) == 1; }
+	for (int i = 0; i < s->nidx && ok; i++) { int32_t r = s->idx[i].frame;        ok = fwrite(&r, sizeof r, 1, f) == 1; }
+	for (int i = 0; i < s->nps && ok; i++) { int64_t o = s->ps[i].nal - s->map;   ok = fwrite(&o, sizeof o, 1, f) == 1; }
+	for (int i = 0; i < s->nps && ok; i++) { int64_t l = s->ps[i].end - s->ps[i].nal; ok = fwrite(&l, sizeof l, 1, f) == 1; }
+	if (fclose(f) != 0) ok = 0;
+	if (!ok) remove(cpath);
+}
+
 /* --- NAL scan (indexing) -------------------------------------------------- */
+
+/* Minimal Exp-Golomb ue(v) reader over the first bytes of a slice RBSP - enough
+ * for first_mb_in_slice and slice_type. Emulation-prevention (00 00 03) cannot
+ * occur this early in a slice header, so raw bytes are read directly. Returns
+ * the value, or -1 if it runs past the available bytes. */
+static int ue_read(const uint8_t *d, int nbytes, int *bitpos) {
+	int lz = 0, bit;
+	for (;;) {
+		if (*bitpos >= nbytes * 8) return -1;
+		bit = (d[*bitpos >> 3] >> (7 - (*bitpos & 7))) & 1;
+		(*bitpos)++;
+		if (bit) break;
+		lz++;
+	}
+	int val = 0;
+	for (int i = 0; i < lz; i++) {
+		if (*bitpos >= nbytes * 8) return -1;
+		val = (val << 1) | ((d[*bitpos >> 3] >> (7 - (*bitpos & 7))) & 1);
+		(*bitpos)++;
+	}
+	return ((1 << lz) - 1) + val;
+}
+
+/* True if the slice at `rbsp` (just past the NAL header byte) is the first slice
+ * of an I (intra) picture: first_mb_in_slice == 0 and slice_type is I. slice_type
+ * values 0..4 = P/B/I/SP/SI; 5..9 repeat for all-same-type slices, so `% 5 == 2`
+ * is I either way. An I picture is only usable as a seek point when it is also a
+ * recovery point (see sei_is_recovery_point) - a plain non-IDR I is NOT: later
+ * pictures may still reference across it (the DPB is not reset), so decoding from
+ * it yields wrong frames. */
+static int slice_is_intra(const uint8_t *rbsp, const uint8_t *end) {
+	int n = (int)(end - rbsp);
+	if (n < 1) return 0;
+	if (n > 8) n = 8;
+	int bitpos = 0;
+	int first_mb = ue_read(rbsp, n, &bitpos);
+	int slice_type = ue_read(rbsp, n, &bitpos);
+	return first_mb == 0 && slice_type >= 0 && slice_type % 5 == 2;
+}
+
+/* True if this SEI NAL (type 6) carries a recovery_point message (payloadType 6)
+ * with recovery_frame_cnt == 0 - i.e. this access unit is an exact open-GOP
+ * random-access recovery point, the marker Blu-ray uses for non-IDR chapter
+ * points. Unlike a plain intra picture, a recovery point guarantees the pictures
+ * after it do not reference across it, so it is a safe seek target. Indexing
+ * these (plus IDRs), not just IDRs, is what lets a seek decode only the recovery-
+ * point spacing (~one I-frame span) instead of a whole, possibly hundreds-of-
+ * frames, IDR GOP. The SEI RBSP is de-emulated into a small buffer first. */
+static int sei_is_recovery_point(const uint8_t *nal, const uint8_t *end) {
+	uint8_t buf[256];
+	int n = 0, zeros = 0;
+	for (const uint8_t *q = nal + 1; q < end && n < (int)sizeof buf; q++) {
+		if (zeros >= 2 && *q == 3) { zeros = 0; continue; } /* drop emulation_prevention_three_byte */
+		buf[n++] = *q;
+		zeros = (*q == 0) ? zeros + 1 : 0;
+	}
+	int i = 0;
+	while (i < n) {
+		int type = 0; while (i < n && buf[i] == 0xff) { type += 255; i++; } if (i >= n) break; type += buf[i++];
+		int size = 0; while (i < n && buf[i] == 0xff) { size += 255; i++; } if (i >= n) break; size += buf[i++];
+		if (type == 6) { /* recovery_point: recovery_frame_cnt is the leading ue(v) */
+			int bitpos = i * 8;
+			return ue_read(buf, n, &bitpos) == 0;
+		}
+		i += size;
+	}
+	return 0;
+}
 
 static void idx_push(MvcSource *s, const uint8_t *nal, int frame) {
 	if (s->nidx == s->idxcap) {
@@ -163,6 +372,7 @@ static void scan_index(MvcSource *s) {
 	int in_vcl = 0;                     /* did we just pass this AU's VCL NALs? */
 	int frames = 0, is_mvc = 0;
 	int seen_sps = 0, seen_pps = 0;     /* a base-view SPS+PPS must precede a counted slice */
+	int recovery_seen = 0;              /* a recovery_point SEI is pending for the next picture */
 	while (p < end) {
 		int type = p[0] & 0x1f;
 		int is_vcl = (type >= 1 && type <= 5) || type == 19 || type == 20;
@@ -177,6 +387,8 @@ static void scan_index(MvcSource *s) {
 			const uint8_t *sc = edge264_find_start_code(p, end, 0);
 			ps_push(s, p, sc < end ? sc : end);
 		}
+		if (type == 6 && sei_is_recovery_point(p, end)) /* marks the next picture a RAP */
+			recovery_seen = 1;
 		if ((type == 1 || type == 5) && (p + 1 < end) && (p[1] & 0x80) && seen_sps && seen_pps) { /* base primary picture */
 			/* If this AU begins directly with its VCL NAL (no leading non-VCL
 			 * NAL advanced au_start), the first slice itself is the AU start.
@@ -184,10 +396,18 @@ static void scan_index(MvcSource *s) {
 			 * every later seek point records the wrong byte offset. */
 			if (in_vcl)
 				au_start = p;
-			if (type == 5)
+			/* Record a seek point at every random-access point: an IDR (type 5),
+			 * or a non-IDR I picture that is an exact recovery point (a preceding
+			 * recovery_point SEI). IDRs alone can be hundreds of frames apart (615
+			 * on a real 3D Blu-ray), which made a backward seek re-decode that whole
+			 * span; recovery points cut it to their spacing (~20). A plain non-IDR I
+			 * is NOT recorded - later pictures may reference across it, so a seek
+			 * there would decode wrong frames (proven on JVT 2D conformance). */
+			if (type == 5 || (slice_is_intra(p + 1, end) && recovery_seen))
 				idx_push(s, au_start, frames);
 			frames++;
 			in_vcl = 1;
+			recovery_seen = 0; /* consumed by this picture */
 		} else if (is_vcl) {
 			in_vcl = 1;
 		}
@@ -271,7 +491,7 @@ static int reset_decoder(MvcSource *s) {
 	edge264_free(&s->dec);
 	s->dec = edge264_alloc(s->n_threads, NULL, NULL, 0, NULL, NULL, NULL);
 	s->last_poc = INT64_MIN; /* display order restarts from the seek point */
-	s->cur_valid = 0;        /* freeing the decoder invalidated cur's buffers */
+	/* the frame cache holds independent copies, so it survives the reset */
 	return s->dec != NULL;
 }
 
@@ -315,6 +535,86 @@ static void copy_plane(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
 	ptrdiff_t sstride, int w, int h) {
 	for (int y = 0; y < h; y++)
 		memcpy(dst + (ptrdiff_t)y * dstride, src + (ptrdiff_t)y * sstride, (size_t)w);
+}
+
+/* --- decoded-frame cache (ring) ------------------------------------------- */
+
+/* Bytes to cache one source picture: base Y/U/V plus, for MVC, the dependent
+ * view's Y/U/V, all stored packed (stride == width). */
+static size_t slot_bytes(const Edge264Frame *f) {
+	size_t one = (size_t)f->width_Y * f->height_Y + 2 * (size_t)f->width_C * f->height_C;
+	return f->samples_mvc[0] ? 2 * one : one;
+}
+
+/* Size the ring from the first decoded frame: as many slots as fit the memory
+ * budget, clamped to [2, MAX]. Buffers are allocated lazily by ring_store.
+ * Returns 0, or -1 on allocation failure. */
+static int ring_init(MvcSource *s, const Edge264Frame *f) {
+	size_t per = slot_bytes(f);
+	int cap = per ? (int)(FRAME_CACHE_BUDGET_BYTES / per) : FRAME_CACHE_MAX_SLOTS;
+	if (cap < 2) cap = 2;
+	if (cap > FRAME_CACHE_MAX_SLOTS) cap = FRAME_CACHE_MAX_SLOTS;
+	s->slots = calloc((size_t)cap, sizeof *s->slots);
+	if (!s->slots) return -1;
+	for (int i = 0; i < cap; i++) s->slots[i].index = -1;
+	s->ring_cap = cap;
+	s->ring_head = 0;
+	return 0;
+}
+
+static FrameSlot *ring_find(MvcSource *s, int index) {
+	for (int i = 0; i < s->ring_cap; i++)
+		if (s->slots[i].index == index) return &s->slots[i];
+	return NULL;
+}
+
+/* Copy borrowed decoder frame `f` into the next ring slot (round-robin) and
+ * build a view over the copy. Returns the slot, or NULL on OOM (the caller then
+ * falls back to the borrowed frame, which is valid until the next decode). */
+static FrameSlot *ring_store(MvcSource *s, int index, const Edge264Frame *f) {
+	if (s->ring_cap == 0) return NULL;
+	FrameSlot *sl = &s->slots[s->ring_head];
+	s->ring_head = (s->ring_head + 1) % s->ring_cap;
+	size_t need = slot_bytes(f);
+	if (sl->bufcap < need) {
+		uint8_t *nb = realloc(sl->buf, need);
+		if (!nb) { sl->index = -1; return NULL; }
+		sl->buf = nb;
+		sl->bufcap = need;
+	}
+	int w = f->width_Y, h = f->height_Y, cw = f->width_C, ch = f->height_C;
+	size_t ysz = (size_t)w * h, csz = (size_t)cw * ch;
+	uint8_t *d = sl->buf;
+	copy_plane(d, w, f->samples[0], f->stride_Y, w, h);
+	copy_plane(d + ysz, cw, f->samples[1], f->stride_C, cw, ch);
+	copy_plane(d + ysz + csz, cw, f->samples[2], f->stride_C, cw, ch);
+	sl->frame = *f; /* metadata; pointers/strides overridden to the packed copy */
+	sl->frame.stride_Y = w;
+	sl->frame.stride_C = cw;
+	sl->frame.samples[0] = d;
+	sl->frame.samples[1] = d + ysz;
+	sl->frame.samples[2] = d + ysz + csz;
+	if (f->samples_mvc[0]) {
+		uint8_t *m = d + ysz + 2 * csz;
+		copy_plane(m, w, f->samples_mvc[0], f->stride_Y, w, h);
+		copy_plane(m + ysz, cw, f->samples_mvc[1], f->stride_C, cw, ch);
+		copy_plane(m + ysz + csz, cw, f->samples_mvc[2], f->stride_C, cw, ch);
+		sl->frame.samples_mvc[0] = m;
+		sl->frame.samples_mvc[1] = m + ysz;
+		sl->frame.samples_mvc[2] = m + ysz + csz;
+	} else {
+		sl->frame.samples_mvc[0] = sl->frame.samples_mvc[1] = sl->frame.samples_mvc[2] = NULL;
+	}
+	sl->index = index;
+	return sl;
+}
+
+static void ring_free(MvcSource *s) {
+	if (!s->slots) return;
+	for (int i = 0; i < s->ring_cap; i++) free(s->slots[i].buf);
+	free(s->slots);
+	s->slots = NULL;
+	s->ring_cap = 0;
 }
 
 /* Write one plane (index 0=Y,1=U,2=V) of frame `f` into dst per `layout`. The
@@ -370,7 +670,8 @@ MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swapl
 	s->n_threads = n_threads;
 	s->swaplr = swaplr != 0;
 
-	s->map = map_file_ro(path, &s->map_size);
+	int64_t src_mtime = 0;
+	s->map = map_file_ro(path, &s->map_size, &src_mtime);
 	if (!s->map) {
 		set_err(err, errsize, "cannot open input file");
 		free(s);
@@ -385,12 +686,25 @@ MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swapl
 	s->start = b + 3 + (b[2] == 0);
 	s->end = b + s->map_size;
 
-	scan_index(s);
+	/* Skip the full-file scan when a matching sidecar index exists; otherwise
+	 * scan and (best-effort) write one for next time. See load_index_cache. */
+	char *cpath = malloc(strlen(path) + sizeof ".mvcidx");
+	int have_cache = 0;
+	if (cpath) {
+		snprintf(cpath, strlen(path) + sizeof ".mvcidx", "%s.mvcidx", path);
+		have_cache = load_index_cache(s, cpath, s->map_size, src_mtime);
+	}
+	if (!have_cache)
+		scan_index(s);
 	if (s->num_pics <= 0) {
+		free(cpath);
 		set_err(err, errsize, "no decodable frames found");
 		mvc_close(s);
 		return NULL;
 	}
+	if (!have_cache && cpath)
+		save_index_cache(s, cpath, s->map_size, src_mtime);
+	free(cpath);
 	s->info.fps_num = fps_num > 0 ? fps_num : 24000;
 	s->info.fps_den = fps_den > 0 ? fps_den : 1001;
 	/* the two-view layouts need a dependent view; on a 2D stream they degrade to
@@ -420,11 +734,14 @@ MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swapl
 		return NULL;
 	}
 	s->next_out = 1;
-	/* keep the first picture cached: the decoder is untouched until the first
-	 * get_frame, so frame 0 is served without a backward seek + re-decode */
-	s->cur = f;
-	s->cur_valid = 1;
-	s->cur_index = 0;
+	/* size the frame cache from the first picture and cache frame 0, so the first
+	 * get_frame(0) is a cache hit rather than a backward seek + re-decode */
+	if (ring_init(s, &f) < 0) {
+		set_err(err, errsize, "out of memory");
+		mvc_close(s);
+		return NULL;
+	}
+	ring_store(s, 0, &f);
 	s->info.base_width = f.width_Y;
 	s->info.base_height = f.height_Y;
 	switch (s->info.layout) {
@@ -435,13 +752,16 @@ MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swapl
 	return s;
 }
 
-/* Ensure source picture `src_n` is decoded and cached in s->cur, seeking if
- * needed. The cache lets MVC_ALT serve both views of a picture from a single
- * decode (the second view is a cache hit, so it issues no edge264_decode_NAL and
- * cur stays valid). Returns 0 on success, -1 on error (message in err). */
+/* Ensure source picture `src_n` is available in s->cur: from the frame cache if
+ * present, else by seeking to the nearest random-access point and decoding
+ * forward. Frames decoded on the way to the target (within the cache window just
+ * before it) are cached too, so a subsequent backward / Reverse pass over the
+ * same span hits RAM instead of re-decoding. This is also what lets MVC_ALT serve
+ * both views of a picture from one decode (the second view is a cache hit).
+ * Returns 0 on success, -1 on error (message in err). */
 static int ensure_source_frame(MvcSource *s, int src_n, char *err, size_t errsize) {
-	if (s->cur_valid && s->cur_index == src_n)
-		return 0;
+	FrameSlot *hit = ring_find(s, src_n);
+	if (hit) { s->cur = hit->frame; return 0; }
 	if (seek_to(s, src_n) < 0) {
 		set_err(err, errsize, "failed to allocate the decoder");
 		return -1;
@@ -454,11 +774,14 @@ static int ensure_source_frame(MvcSource *s, int src_n, char *err, size_t errsiz
 			return -1;
 		}
 		int idx = s->next_out++;
-		if (idx == src_n) {
-			s->cur = f;
-			s->cur_valid = 1;
-			s->cur_index = idx;
-			return 0;
+		/* cache frames in the window just before the target - exactly what a
+		 * backward / Reverse pass asks for next; the target itself is always in
+		 * the window (ring_cap >= 2). On OOM caching the target, fall back to the
+		 * borrowed frame (valid until the next decode, which mvc_get_frame
+		 * precedes with its assemble). */
+		if (idx > src_n - s->ring_cap) {
+			FrameSlot *sl = ring_store(s, idx, &f);
+			if (idx == src_n) { s->cur = sl ? sl->frame : f; return 0; }
 		}
 	}
 }
@@ -491,6 +814,7 @@ int mvc_get_frame(MvcSource *s, int n,
 void mvc_close(MvcSource *s) {
 	if (!s) return;
 	if (s->dec) edge264_free(&s->dec);
+	ring_free(s);
 	free(s->idx);
 	free(s->ps);
 	unmap_file(s->map, s->map_size);

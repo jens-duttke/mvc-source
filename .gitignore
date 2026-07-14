@@ -7,6 +7,7 @@
 /enomemtest
 /allocfailtest
 /poctest
+/cachetest
 *.o
 *.a
 *.so
@@ -19,6 +20,7 @@
 *.yuv
 *.y4m
 *.mp4
+*.mvcidx
 /build/
 
 # local working artifacts (audit output, not part of the published plugin)
