@@ -47,20 +47,18 @@ both hosts** (correct frame count, dimensions, frame-accurate seeking).
   bit-identical output. Writing is best-effort (a read-only directory simply
   means no cache, never a failed open); a stale or corrupt sidecar is detected
   and a fresh scan runs.
-- [x] **Fast random-access seeking** - seek points are recorded at every
-  random-access point: an IDR, or a non-IDR I picture that carries a
-  `recovery_point` SEI (recovery_frame_cnt 0), the exact open-GOP recovery point
-  Blu-ray uses for chapter/entry points. A plain non-IDR I picture is *not* a
-  seek point - later pictures may reference across it, so decoding from it would
-  return wrong frames (verified against the JVT 2D conformance set). Because
-  IDRs alone can be hundreds of frames apart (615 on a real 3D Blu-ray),
-  indexing recovery points cuts a seek to their spacing (~20 frames) instead of
-  a whole IDR GOP. A bounded decoded-frame cache (~128 MB, like BestSource's
-  `cachesize`) then serves backward / repeat / `Reverse()` access from RAM.
-  Measured on a 1.4 GB MVC stream: a near-end seek dropped from ~18 s to ~0.5 s,
-  backward-adjacent access to ~0.2 ms, and AviSynth `Reverse()` went from never
-  displaying a frame to ~35 fps single-threaded, bit-exact - while remaining
-  bit-exact on the full JVT conformance corpus.
+- [x] **Random-access seeking + decoded-frame cache** - a seek decodes forward
+  from the nearest preceding IDR (the only guaranteed H.264 random-access point:
+  it resets the DPB, so a cold decode from it is bit-exact). A bounded
+  decoded-frame cache (~128 MB, modelled on BestSource's `cachesize`) holds
+  independent frame copies that survive a decoder reset, so backward / repeat /
+  `Reverse()` access is served from RAM (~0.2 ms) instead of re-decoding: AviSynth
+  `Reverse()` went from never displaying a frame to real-time playback, bit-exact.
+  Frame-accurate and bit-exact against a sequential decode across the full JVT
+  conformance corpus and on a real 3D Blu-ray. Note: on a stream with a very long
+  IDR spacing (some 3D Blu-rays run 600+ frames between IDRs), a cold seek into
+  the middle of such a GOP re-decodes from its IDR and can be slow; multithreaded
+  decode (`threads=-1`) and the frame cache absorb most of that in practice.
 - [ ] VUI frame-rate auto-detection.
 
 ## Usage

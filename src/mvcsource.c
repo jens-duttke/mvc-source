@@ -159,7 +159,7 @@ static void unmap_file(uint8_t *p, size_t size) {
  * Machine-local artifact: written and read by the same build, so native field
  * sizes/order are fine (the magic gates any future format change).
  */
-#define MVCIDX_MAGIC "MVCIDX02" /* bump the trailing digits to invalidate old caches (02: seek points now include non-IDR I-frame RAPs) */
+#define MVCIDX_MAGIC "MVCIDX03" /* bump the trailing digits to invalidate old caches (03: seek points are IDR-only again - 02's non-IDR recovery-point seek points were unsafe on open GOPs) */
 
 struct idx_hdr {
 	char     magic[8];   /* MVCIDX_MAGIC, no NUL */
@@ -257,74 +257,6 @@ static void save_index_cache(const MvcSource *s, const char *cpath, uint64_t src
 
 /* --- NAL scan (indexing) -------------------------------------------------- */
 
-/* Minimal Exp-Golomb ue(v) reader over the first bytes of a slice RBSP - enough
- * for first_mb_in_slice and slice_type. Emulation-prevention (00 00 03) cannot
- * occur this early in a slice header, so raw bytes are read directly. Returns
- * the value, or -1 if it runs past the available bytes. */
-static int ue_read(const uint8_t *d, int nbytes, int *bitpos) {
-	int lz = 0, bit;
-	for (;;) {
-		if (*bitpos >= nbytes * 8) return -1;
-		bit = (d[*bitpos >> 3] >> (7 - (*bitpos & 7))) & 1;
-		(*bitpos)++;
-		if (bit) break;
-		lz++;
-	}
-	int val = 0;
-	for (int i = 0; i < lz; i++) {
-		if (*bitpos >= nbytes * 8) return -1;
-		val = (val << 1) | ((d[*bitpos >> 3] >> (7 - (*bitpos & 7))) & 1);
-		(*bitpos)++;
-	}
-	return ((1 << lz) - 1) + val;
-}
-
-/* True if the slice at `rbsp` (just past the NAL header byte) is the first slice
- * of an I (intra) picture: first_mb_in_slice == 0 and slice_type is I. slice_type
- * values 0..4 = P/B/I/SP/SI; 5..9 repeat for all-same-type slices, so `% 5 == 2`
- * is I either way. An I picture is only usable as a seek point when it is also a
- * recovery point (see sei_is_recovery_point) - a plain non-IDR I is NOT: later
- * pictures may still reference across it (the DPB is not reset), so decoding from
- * it yields wrong frames. */
-static int slice_is_intra(const uint8_t *rbsp, const uint8_t *end) {
-	int n = (int)(end - rbsp);
-	if (n < 1) return 0;
-	if (n > 8) n = 8;
-	int bitpos = 0;
-	int first_mb = ue_read(rbsp, n, &bitpos);
-	int slice_type = ue_read(rbsp, n, &bitpos);
-	return first_mb == 0 && slice_type >= 0 && slice_type % 5 == 2;
-}
-
-/* True if this SEI NAL (type 6) carries a recovery_point message (payloadType 6)
- * with recovery_frame_cnt == 0 - i.e. this access unit is an exact open-GOP
- * random-access recovery point, the marker Blu-ray uses for non-IDR chapter
- * points. Unlike a plain intra picture, a recovery point guarantees the pictures
- * after it do not reference across it, so it is a safe seek target. Indexing
- * these (plus IDRs), not just IDRs, is what lets a seek decode only the recovery-
- * point spacing (~one I-frame span) instead of a whole, possibly hundreds-of-
- * frames, IDR GOP. The SEI RBSP is de-emulated into a small buffer first. */
-static int sei_is_recovery_point(const uint8_t *nal, const uint8_t *end) {
-	uint8_t buf[256];
-	int n = 0, zeros = 0;
-	for (const uint8_t *q = nal + 1; q < end && n < (int)sizeof buf; q++) {
-		if (zeros >= 2 && *q == 3) { zeros = 0; continue; } /* drop emulation_prevention_three_byte */
-		buf[n++] = *q;
-		zeros = (*q == 0) ? zeros + 1 : 0;
-	}
-	int i = 0;
-	while (i < n) {
-		int type = 0; while (i < n && buf[i] == 0xff) { type += 255; i++; } if (i >= n) break; type += buf[i++];
-		int size = 0; while (i < n && buf[i] == 0xff) { size += 255; i++; } if (i >= n) break; size += buf[i++];
-		if (type == 6) { /* recovery_point: recovery_frame_cnt is the leading ue(v) */
-			int bitpos = i * 8;
-			return ue_read(buf, n, &bitpos) == 0;
-		}
-		i += size;
-	}
-	return 0;
-}
-
 static void idx_push(MvcSource *s, const uint8_t *nal, int frame) {
 	if (s->nidx == s->idxcap) {
 		int cap = s->idxcap ? s->idxcap * 2 : 256;
@@ -372,7 +304,6 @@ static void scan_index(MvcSource *s) {
 	int in_vcl = 0;                     /* did we just pass this AU's VCL NALs? */
 	int frames = 0, is_mvc = 0;
 	int seen_sps = 0, seen_pps = 0;     /* a base-view SPS+PPS must precede a counted slice */
-	int recovery_seen = 0;              /* a recovery_point SEI is pending for the next picture */
 	while (p < end) {
 		int type = p[0] & 0x1f;
 		int is_vcl = (type >= 1 && type <= 5) || type == 19 || type == 20;
@@ -387,8 +318,6 @@ static void scan_index(MvcSource *s) {
 			const uint8_t *sc = edge264_find_start_code(p, end, 0);
 			ps_push(s, p, sc < end ? sc : end);
 		}
-		if (type == 6 && sei_is_recovery_point(p, end)) /* marks the next picture a RAP */
-			recovery_seen = 1;
 		if ((type == 1 || type == 5) && (p + 1 < end) && (p[1] & 0x80) && seen_sps && seen_pps) { /* base primary picture */
 			/* If this AU begins directly with its VCL NAL (no leading non-VCL
 			 * NAL advanced au_start), the first slice itself is the AU start.
@@ -396,18 +325,17 @@ static void scan_index(MvcSource *s) {
 			 * every later seek point records the wrong byte offset. */
 			if (in_vcl)
 				au_start = p;
-			/* Record a seek point at every random-access point: an IDR (type 5),
-			 * or a non-IDR I picture that is an exact recovery point (a preceding
-			 * recovery_point SEI). IDRs alone can be hundreds of frames apart (615
-			 * on a real 3D Blu-ray), which made a backward seek re-decode that whole
-			 * span; recovery points cut it to their spacing (~20). A plain non-IDR I
-			 * is NOT recorded - later pictures may reference across it, so a seek
-			 * there would decode wrong frames (proven on JVT 2D conformance). */
-			if (type == 5 || (slice_is_intra(p + 1, end) && recovery_seen))
+			/* Record a seek point at every IDR (type 5). An IDR is the only
+			 * guaranteed random-access point in H.264: it resets the DPB, so a
+			 * cold decode from it is bit-exact. A non-IDR I picture is NOT safe -
+			 * even when it carries a recovery_point SEI, an open-GOP recovery
+			 * point can have leading pictures that reference the previous GOP, so
+			 * a cold decode returns wrong frames for those display positions (and
+			 * the count of leading pictures is not knowable from a NAL scan). */
+			if (type == 5)
 				idx_push(s, au_start, frames);
 			frames++;
 			in_vcl = 1;
-			recovery_seen = 0; /* consumed by this picture */
 		} else if (is_vcl) {
 			in_vcl = 1;
 		}
