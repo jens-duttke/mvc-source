@@ -19,7 +19,7 @@ permissions:
 env:
   # edge264-mvc release the binaries are built against. Keep in sync with
   # tests.yml's EDGE264_REF; bump both to the matching edge264-mvc tag.
-  EDGE264_REF: v2026.07.11
+  EDGE264_REF: v2026.07.13
 
 jobs:
   release-binaries:
