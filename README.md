@@ -118,6 +118,13 @@ Individual targets: `make libvsmvc.so` (VapourSynth), `make libavsmvc.so`
 (AviSynth+). Tested on Linux; CI builds and bit-exact-verifies both plugins
 against edge264-mvc `v2026.07.13` and AviSynth+ `v3.7.3`.
 
+The **released** binaries target a portable `x86-64-v2` floor (SSE4.2, runs on
+~2009-and-later CPUs), with edge264's runtime dispatch lifting the parser to AVX2
+(`x86-64-v3`) where the CPU supports it - so one binary runs across CPU
+generations at full speed on modern hardware. A plain local `make` instead builds
+for the build machine (`-march=native`); to reproduce the portable release ISA
+pass `EDGE264_MAKE="VARIANTS=x86-64-v2,x86-64-v3 CFLAGS=-march=x86-64-v2"`.
+
 ### Windows cross-build (MinGW-w64)
 
 The AviSynth+ plugin cross-compiles from Linux to a self-contained Windows `.dll`

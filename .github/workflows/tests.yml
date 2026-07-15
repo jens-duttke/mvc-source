@@ -39,6 +39,15 @@ jobs:
   test:
     name: Core + plugin (mock VapourSynth host)
     runs-on: ubuntu-latest
+    # Gate make check on the exact portable ISA the release ships (x86-64-v2 floor +
+    # AVX2 runtime dispatch, see release.yml), not a native build, so the
+    # distributed build's correctness - not merely a native one's - is CI-verified.
+    # Scoped to this job only: the vapoursynth/avisynth jobs build a native
+    # edge264_test reference in the same edge264 tree, and mixing its default
+    # VARIANTS=logs with a v2/v3 plugin build would re-archive libedge264.a without
+    # the variant objects the core references. This job builds no edge264_test.
+    env:
+      EDGE264_MAKE: "VARIANTS=x86-64-v2,x86-64-v3 CFLAGS=-march=x86-64-v2"
     steps:
       - uses: actions/checkout@v5
       - name: Fetch edge264-mvc

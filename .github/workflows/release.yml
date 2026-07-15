@@ -20,6 +20,17 @@ env:
   # edge264-mvc release the binaries are built against. Keep in sync with
   # tests.yml's EDGE264_REF; bump both to the matching edge264-mvc tag.
   EDGE264_REF: v2026.07.13
+  # Portable ISA for the DISTRIBUTED Linux .so builds. edge264's native build
+  # injects -march=native, which bakes in whatever ISA the CI runner happens to
+  # have; a runner with AVX-512 once produced a .so that crashed with SIGILL on
+  # every CPU without AVX-512 (the v0.4.4 regression). Pin the x86-64-v2 floor
+  # (SSE4.2, runs on ~2009+ CPUs) and let edge264's runtime dispatch lift the
+  # parser to AVX2 (x86-64-v3) where the CPU has it - full speed on modern CPUs,
+  # no illegal instruction on old ones. The Windows cross-build steps set
+  # EDGE264_MAKE on the command line (OS=windows...), which overrides this env
+  # value, so this only affects the native Linux builds (the Windows DLL is
+  # already ISA-baseline via the MinGW cross-compile).
+  EDGE264_MAKE: "VARIANTS=x86-64-v2,x86-64-v3 CFLAGS=-march=x86-64-v2"
 
 jobs:
   release-binaries:
@@ -34,7 +45,22 @@ jobs:
       - name: Fetch edge264-mvc
         run: git clone --depth 1 --branch "$EDGE264_REF" https://github.com/jens-duttke/edge264-mvc ../edge264
       - name: Build the Linux plugins (.so)
+        # Portable ISA floor via EDGE264_MAKE (see env) - never -march=native for a
+        # distributed binary.
         run: make libvsmvc.so libavsmvc.so
+      - name: Verify the Linux plugins carry no AVX-512 (portable ISA floor)
+        # Guard against a reintroduced native build: a distributed .so must contain
+        # no AVX-512 (EVEX-prefixed) instructions, or it SIGILLs on any CPU without
+        # AVX-512. In 64-bit code the opcode byte 0x62 is exclusively the EVEX
+        # prefix, so a disassembly line whose first instruction byte is 62 is an
+        # AVX-512 instruction. (Anchored to instruction-start lines - "addr:\t62 " -
+        # so a wrapped byte-continuation line cannot false-positive.)
+        run: |
+          for so in libvsmvc.so libavsmvc.so; do
+            n=$(objdump -d "$so" | grep -cP '^\s+[0-9a-f]+:\t62 ' || true)
+            echo "$so: $n AVX-512 (EVEX) instruction(s)"
+            test "$n" = 0
+          done
       - name: Cross-build edge264-mvc for Windows (separate tree)
         run: |
           cp -r ../edge264 ../edge264-win
