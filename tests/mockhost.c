@@ -332,6 +332,14 @@ static void test_fps_semantics(const char *path, int *fail) {
 	if (n) { printf("FAIL[fps]: fpsnum=-5 accepted (want error)\n"); *fail = 1; free_node(n); }
 	else printf("ok[fps]: non-positive fpsnum rejected: %s\n", err);
 
+	/* L5: an fpsnum past INT64_MAX/2 would overflow the MVC_ALT `fps_num *= 2` in
+	 * mvc_open (int64 signed overflow, UB) and surface as a cryptic "invalid
+	 * VSVideoInfo". The glue must reject such a rate up front (it is never
+	 * meaningful), which the unbounded old code let through. */
+	n = call_source_ints(path, 1, 9223372036854775807LL /* INT64_MAX */, 1, 1, err, sizeof err);
+	if (n) { printf("FAIL[fps]: overflow-inducing fpsnum accepted (want error)\n"); *fail = 1; free_node(n); }
+	else printf("ok[fps]: overflow-inducing fpsnum rejected: %s\n", err);
+
 	/* M2: a non-coprime pair must be reduced before createVideoFilter, not
 	 * forwarded raw (which the core rejects as an invalid VSVideoInfo). */
 	n = call_source_ints(path, 1, 30000, 1, 1002, err, sizeof err);

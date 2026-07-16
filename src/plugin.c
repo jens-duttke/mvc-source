@@ -106,6 +106,15 @@ static void VS_CC vs_source_create(const VSMap *in, VSMap *out, void *userData,
 		vsapi->mapSetError(out, "mvc.Source: fpsnum and fpsden must be positive");
 		return;
 	}
+	/* Upper bound: the MVC_ALT layout doubles the numerator (fps_num *= 2 in
+	 * mvc_open), so an fpsnum past INT64_MAX/2 would overflow that int64 (UB) and
+	 * surface only as a cryptic "invalid VSVideoInfo". A frame rate that large is
+	 * never meaningful, so reject it here (the AviSynth glue is immune - avs_as_int
+	 * already narrows fpsnum to 32-bit). */
+	if ((have_num && fpsnum > INT64_MAX / 2) || (have_den && fpsden > INT64_MAX / 2)) {
+		vsapi->mapSetError(out, "mvc.Source: fpsnum and fpsden are unreasonably large");
+		return;
+	}
 	if (!have_num) { fpsnum = 0; fpsden = 0; }
 
 	char emsg[256];
