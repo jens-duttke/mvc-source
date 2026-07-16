@@ -32,7 +32,7 @@ AVS_DLL   := libavsmvc.dll
 VS_DLL    := libvsmvc.dll
 
 .PHONY: all clean check check-bitexact check-avs
-all: coretest mockhost seektest enomemtest allocfailtest poctest cachetest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
+all: coretest mockhost seektest enomemtest allocfailtest poctest stalltest cachetest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
 
 # edge264 as a self-contained static library. FORCE so the sub-make always runs
 # and decides up-to-dateness itself: a bare file target with no prerequisites is
@@ -151,6 +151,14 @@ poctest: tests/poctest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264_get_frame \
 	    tests/poctest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
+# ENOBUFS-stall test: --wrap intercepts both edge264 entry points to hold the
+# decoder in a persistent-ENOBUFS / no-frame state (a DPB stuck full of incomplete
+# pictures), checking the caller loop's progress guard fails loudly instead of
+# spinning forever. Committed fixture, no TEST_FILE.
+stalltest: tests/stalltest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
+	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264_decode_NAL -Wl,--wrap=edge264_get_frame \
+	    tests/stalltest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
+
 # On-disk index-cache regression: cache hit == fresh scan, and a corrupt / stale
 # sidecar is ignored rather than trusted. Committed fixture, no TEST_FILE.
 cachetest: tests/cachetest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
@@ -166,7 +174,7 @@ avsnulltest: tests/avsnulltest.c src/avisynth_plugin.c src/mvcsource.c src/mvcso
 	$(CC) $(CFLAGS) -Wno-missing-field-initializers $(INCLUDES) \
 	    tests/avsnulltest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
-check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest cachetest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
+check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest stalltest cachetest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
 	@echo "== makefile behaviour (edge264 sub-make always delegated) =="
 	sh tests/mkcheck.sh "$(EDGE264_SRC)"
 	@echo "== seek regression (headerless-GOP / AUD-headed, committed fixture) =="
@@ -177,6 +185,8 @@ check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest
 	./allocfailtest tests/fixtures/base_multigop.264
 	@echo "== display-order tripwire (injected via --wrap) =="
 	./poctest tests/fixtures/base_multigop.264
+	@echo "== ENOBUFS-stall progress guard (injected via --wrap) =="
+	./stalltest tests/fixtures/base_multigop.264
 	@echo "== on-disk index cache (miss/hit + corrupt/stale, committed fixture) =="
 	./cachetest tests/fixtures/base_multigop.264
 	@echo "== AviSynth+ get_frame OOM handling (stubbed host, committed fixture) =="
@@ -244,5 +254,5 @@ endif
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264: OK" || { echo "MISMATCH"; exit 1; }
 
 clean:
-	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest cachetest avsnulltest avshost \
+	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest stalltest cachetest avsnulltest avshost \
 	    $(PLUGIN) $(AVS_PLUGIN) $(AVS_DLL) $(VS_DLL) *.exe src/*.o

@@ -401,7 +401,20 @@ static int decode_next_output(MvcSource *s, Edge264Frame *out, char *err, size_t
 			return check_display_order(s, out, err, errsize) ? 1 : -1;
 		}
 		if (r == ENOBUFS) {
-			if (++stuck > 64) { s->nal = s->end; stuck = 0; } /* force the flush sentinel */
+			/* The output queue is full and get_frame drains nothing - on a
+			 * well-formed stream every ENOBUFS releases at least one frame, so
+			 * this only accumulates on degenerate/crafted input whose pictures
+			 * never complete. edge264 checks its per-view fullness gate before the
+			 * buf>=end drain branch, so the flush sentinel (s->end,s->end) also
+			 * returns ENOBUFS and cannot arm the drain via the public API (its own
+			 * harness reaches into the private `flushing` flag, which edge264.h
+			 * does not expose). Forcing the sentinel here would spin forever at
+			 * 100% CPU, so fail loudly instead - a source filter must not hang on
+			 * untrusted media. Matches the ENOMEM/EINVAL data-loss handling below. */
+			if (++stuck > 64) {
+				set_err(err, errsize, "decoder stalled: output queue full but no frame available (corrupt stream?)");
+				return -1;
+			}
 			continue;
 		}
 		stuck = 0;
