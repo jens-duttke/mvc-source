@@ -32,7 +32,7 @@ AVS_DLL   := libavsmvc.dll
 VS_DLL    := libvsmvc.dll
 
 .PHONY: all clean check check-bitexact check-avs
-all: coretest mockhost seektest enomemtest allocfailtest poctest cachetest $(PLUGIN) $(AVS_PLUGIN)
+all: coretest mockhost seektest enomemtest allocfailtest poctest cachetest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
 
 # edge264 as a self-contained static library. FORCE so the sub-make always runs
 # and decides up-to-dateness itself: a bare file target with no prerequisites is
@@ -156,7 +156,17 @@ poctest: tests/poctest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 cachetest: tests/cachetest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 	$(CC) $(CFLAGS) $(INCLUDES) tests/cachetest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
-check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest cachetest $(PLUGIN) $(AVS_PLUGIN)
+# AviSynth+ get_frame callback regression: a failed host frame allocation
+# (avs_new_video_frame_a -> NULL) must be reported as a catchable error, never
+# dereferenced. The AviSynth C host functions are stubbed at link time (POSIX
+# resolves them as plain extern-"C" symbols), so no libavisynth is needed. The
+# glue source is #included, hence -Wno-missing-field-initializers for the
+# vendored header's `avs_void = {'v'}`. Committed fixture, no TEST_FILE.
+avsnulltest: tests/avsnulltest.c src/avisynth_plugin.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
+	$(CC) $(CFLAGS) -Wno-missing-field-initializers $(INCLUDES) \
+	    tests/avsnulltest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
+
+check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest cachetest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
 	@echo "== makefile behaviour (edge264 sub-make always delegated) =="
 	sh tests/mkcheck.sh "$(EDGE264_SRC)"
 	@echo "== seek regression (headerless-GOP / AUD-headed, committed fixture) =="
@@ -169,6 +179,8 @@ check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest
 	./poctest tests/fixtures/base_multigop.264
 	@echo "== on-disk index cache (miss/hit + corrupt/stale, committed fixture) =="
 	./cachetest tests/fixtures/base_multigop.264
+	@echo "== AviSynth+ get_frame OOM handling (stubbed host, committed fixture) =="
+	./avsnulltest tests/fixtures/base_multigop.264
 	@echo "== test.vpy argument guards (stub VapourSynth) =="
 	python3 tests/vpycheck.py
 ifndef TEST_FILE
@@ -232,5 +244,5 @@ endif
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264: OK" || { echo "MISMATCH"; exit 1; }
 
 clean:
-	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest cachetest avshost \
+	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest cachetest avsnulltest avshost \
 	    $(PLUGIN) $(AVS_PLUGIN) $(AVS_DLL) $(VS_DLL) *.exe src/*.o

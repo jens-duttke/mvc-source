@@ -43,6 +43,15 @@ static int parse_layout(const char *s) {
 static AVS_VideoFrame *AVSC_CC mvc_cb_get_frame(AVS_FilterInfo *fi, int n) {
 	MvcSource *src = (MvcSource *)fi->user_data;
 	AVS_VideoFrame *f = avs_new_video_frame_a(fi->env, &fi->vi, AVS_FRAME_ALIGN);
+	/* avs_new_video_frame_a returns NULL when the host cannot allocate the frame
+	 * (memory limit / OOM). avs_get_write_ptr_p(NULL, ...) would dereference the
+	 * NULL frame inside the host, so report a catchable error here instead - and
+	 * do NOT avs_release_video_frame a NULL frame. Returning NULL without setting
+	 * fi->error would crash the host downstream, so setting it is mandatory. */
+	if (!f) {
+		fi->error = avs_save_string(fi->env, "MVCSource: could not allocate video frame", -1);
+		return NULL;
+	}
 	char err[256];
 	/* AVS_PLANAR_U/V give the logical U/V planes; AviSynth's YV12 stores V before
 	 * U physically, but the plane constants hide that, so no manual swap. */
