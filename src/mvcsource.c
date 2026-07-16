@@ -199,8 +199,12 @@ static int load_index_cache(MvcSource *s, const char *cpath, uint64_t src_size, 
 	if (memcmp(h.magic, MVCIDX_MAGIC, 8) != 0 || h.src_size != src_size ||
 	    h.src_mtime != src_mtime || h.num_pics <= 0 || h.nidx < 0 || h.nps < 0)
 		goto done;
-	/* caps guard against a corrupt count forcing a huge allocation */
-	if (h.nidx > (1 << 28) || h.nps > (1 << 26))
+	/* Caps guard against a corrupt/hostile count: nidx/nps bound the allocations,
+	 * and num_pics bounds the frame total - unbounded it would give a wrong count
+	 * and, via the MVC_ALT `num_pics * 2`, overflow the int num_frames negative so
+	 * the clip rejects every frame. 1<<28 is far above any real stream and keeps
+	 * the doubling within int (2^29 < INT_MAX). */
+	if (h.nidx > (1 << 28) || h.nps > (1 << 26) || h.num_pics > (1 << 28))
 		goto done;
 	if (h.nidx) {
 		ioff = malloc((size_t)h.nidx * sizeof *ioff);

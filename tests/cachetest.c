@@ -76,6 +76,27 @@ static int file_exists(const char *p) {
 	return 1;
 }
 
+/* Open `path` (base view) and return its reported output frame count, or -1. */
+static int open_num_frames(const char *path) {
+	char err[256] = "";
+	MvcSource *s = mvc_open(path, 0, MVC_BASE, 0, 0, 0, 0, err, sizeof err);
+	if (!s) { fprintf(stderr, "  open failed: %s\n", err); return -1; }
+	int nf = mvc_info(s)->num_frames;
+	mvc_close(s);
+	return nf;
+}
+
+/* Overwrite the little-endian int32 at byte offset `off` in `path`. The sidecar
+ * layout is magic[8] src_size[8] src_mtime[8] num_pics[4] ... - num_pics is at
+ * offset 24. Returns 0 on success. */
+static int patch_i32(const char *path, long off, int32_t val) {
+	FILE *f = fopen(path, "r+b");
+	if (!f) return -1;
+	int rc = fseek(f, off, SEEK_SET) == 0 && fwrite(&val, sizeof val, 1, f) == 1 ? 0 : -1;
+	if (fclose(f) != 0) rc = -1;
+	return rc;
+}
+
 /* Copy src -> dst byte for byte. Returns 0 on success. */
 static int copy_file(const char *src, const char *dst) {
 	FILE *in = fopen(src, "rb"), *out = in ? fopen(dst, "wb") : NULL;
@@ -134,6 +155,24 @@ int main(int argc, char **argv) {
 	if (hash_frames(tmp, stale) || memcmp(miss, stale, sizeof miss) != 0) {
 		printf("FAIL[stale]: stale cache (changed source) not detected\n"); ok = 0;
 	} else printf("ok[stale]: stale sidecar detected, rescanned\n");
+
+	/* 5. forged num_pics: a sidecar with valid magic + matching size/mtime but an
+	 * out-of-range picture count must be ignored, not trusted into a wrong frame
+	 * total (and, via the MVC_ALT *2, an int overflow that makes num_frames go
+	 * negative so the clip rejects every frame). Write a fresh valid sidecar, patch
+	 * only its num_pics to an oversized value, and reopen: the count must fall back
+	 * to a fresh scan, not to the forged value. */
+	{
+		remove(cache);
+		int real_nf = open_num_frames(tmp);          /* scans + writes a fresh valid sidecar */
+		if (real_nf <= 0) { printf("FAIL[numpics]: could not determine the real frame count\n"); ok = 0; }
+		else if (patch_i32(cache, 24, 0x40000000)) { printf("WARN[numpics]: could not patch sidecar, skipping\n"); }
+		else {
+			int nf = open_num_frames(tmp);
+			if (nf != real_nf) { printf("FAIL[numpics]: forged num_pics accepted (num_frames=%d, real=%d)\n", nf, real_nf); ok = 0; }
+			else printf("ok[numpics]: oversized num_pics rejected, rescanned to %d frames\n", nf);
+		}
+	}
 
 out:
 	remove(cache);
