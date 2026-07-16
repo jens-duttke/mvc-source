@@ -468,8 +468,13 @@ static int seek_to(MvcSource *s, int target) {
 	}
 	int sp_frame = best >= 0 ? s->idx[best].frame : 0;
 	const uint8_t *sp_nal = best >= 0 ? s->idx[best].nal : s->start;
-	/* only restart if we must go backwards or a closer seek point lies ahead */
-	if (target < s->next_out || sp_frame > s->next_out) {
+	/* Restart if we must go backwards, a closer seek point lies ahead, or the
+	 * decoder is absent - a prior seek's reset_decoder may have freed it and then
+	 * failed to reallocate (OOM), and without the NULL check an in-window forward
+	 * request (target >= next_out, nearest seek point <= next_out) would take the
+	 * no-restart path and decode against the NULL decoder, a persistent failure
+	 * that never re-attempts the allocation. */
+	if (s->dec == NULL || target < s->next_out || sp_frame > s->next_out) {
 		if (!reset_decoder(s))
 			return -1;
 		refeed_param_sets(s, sp_nal);
