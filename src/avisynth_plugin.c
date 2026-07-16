@@ -71,7 +71,12 @@ static AVS_VideoFrame *AVSC_CC mvc_cb_get_frame(AVS_FilterInfo *fi, int n) {
 
 static int AVSC_CC mvc_cb_get_parity(AVS_FilterInfo *fi, int n) {
 	(void)fi; (void)n;
-	return 1; /* progressive */
+	/* Frame-based (progressive) clip: report the conventional neutral parity of the
+	 * first field. GetParity answers "is the first field top?", which cannot express
+	 * "progressive"; the neutral convention other frame-based sources (BlankClip,
+	 * FFMS2, StaticImage) use is false/0, matching vi.image_type = 0 (no AVS_IT_TFF).
+	 * A constant 1 would assert top-field-first and flip SeparateFields/Bob order. */
+	return 0;
 }
 
 static int AVSC_CC mvc_cb_get_audio(AVS_FilterInfo *fi, void *buf, int64_t start, int64_t count) {

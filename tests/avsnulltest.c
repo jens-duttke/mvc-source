@@ -1,6 +1,7 @@
 /*
- * avsnulltest - regression test for the AviSynth+ get_frame callback's handling
- * of a failed frame allocation.
+ * avsnulltest - regression tests for the AviSynth+ filter callbacks: the
+ * get_frame callback's handling of a failed frame allocation, and the get_parity
+ * convention for a frame-based clip.
  *
  * AviSynth+'s avs_new_video_frame_a returns NULL (0) when it cannot allocate the
  * frame (memory limit / OOM - realistic on 32-bit hosts with doubled-size
@@ -132,10 +133,18 @@ int main(int argc, char **argv) {
 	int normal_ok = (ok != NULL) && (fi.error == NULL);
 	printf("alloc-succeeds: out=%p error=%s\n", (void *)ok, fi.error ? fi.error : "(none)");
 
+	/* get_parity: a frame-based (progressive) clip must report the conventional
+	 * neutral parity (false / 0), matching BlankClip / FFMS2 / StaticImage. A
+	 * constant 1 asserts top-field-first, so SeparateFields / Bob / Weave would run
+	 * in the opposite field order from every other neutral source. */
+	int parity = mvc_cb_get_parity(&fi, 0);
+	int parity_ok = parity == 0;
+	printf("get-parity: %d (want 0 = neutral/BFF)\n", parity);
+
 	free(g_planebuf);
 	mvc_close(src);
 
-	if (passed && normal_ok) { printf("RESULT: PASS (failed frame allocation reported, NULL frame never dereferenced)\n"); return 0; }
-	printf("RESULT: FAIL (passed=%d normal_ok=%d)\n", passed, normal_ok);
+	if (passed && normal_ok && parity_ok) { printf("RESULT: PASS (failed frame allocation reported, NULL frame never dereferenced; neutral parity)\n"); return 0; }
+	printf("RESULT: FAIL (passed=%d normal_ok=%d parity_ok=%d)\n", passed, normal_ok, parity_ok);
 	return 1;
 }
