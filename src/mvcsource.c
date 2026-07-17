@@ -49,11 +49,14 @@
  */
 typedef struct { const uint8_t *nal; int frame, valid_from; } SeekPoint;
 
-/* A parameter-set NAL (SPS / PPS / subset-SPS) span in the mapped stream, in the
- * order it appears. On a seek the decoder is torn down and recreated, so the
- * parameter sets active at the seek point must be re-fed to the fresh decoder;
- * streams that carry the sets only once at the start do not repeat them per IDR. */
-typedef struct { const uint8_t *nal, *end; } ParamNal;
+/* A parameter-set NAL (SPS / PPS / SPS-extension / subset-SPS) span in the mapped
+ * stream, in the order it appears. On a seek the decoder is torn down and
+ * recreated, so the parameter sets active at the seek point must be re-fed to the
+ * fresh decoder; streams that carry the sets only once at the start do not repeat
+ * them per IDR. `type` is the NAL type and `id` the set's id (-1 if unreadable);
+ * together they identify which sets a later one overrides, so a seek can re-feed
+ * only those still active - see refeed_param_sets for why that is not just tidiness. */
+typedef struct { const uint8_t *nal, *end; int type, id; } ParamNal;
 
 /* A cached decoded source picture: an independent copy of the base (and, for
  * MVC, the dependent) view's packed planes, plus an Edge264Frame view over that
@@ -189,7 +192,7 @@ static void unmap_file(uint8_t *p, size_t size) {
  * Machine-local artifact: written and read by the same build, so native field
  * sizes/order are fine (the magic gates any future format change).
  */
-#define MVCIDX_MAGIC "MVCIDX04" /* bump the trailing digits to invalidate old caches (04: seek points are back on every random-access point, now carrying the POC-derived valid_from that 02 lacked) */
+#define MVCIDX_MAGIC "MVCIDX05" /* bump the trailing digits to invalidate old caches (05: parameter sets now carry their type + id, so a seek re-feeds only the active ones) */
 
 struct idx_hdr {
 	char     magic[8];   /* MVCIDX_MAGIC, no NUL */
@@ -212,7 +215,7 @@ static int load_index_cache(MvcSource *s, const char *cpath, uint64_t src_size, 
 	struct idx_hdr h;
 	int ok = 0;
 	int64_t *ioff = NULL, *poff = NULL, *plen = NULL;
-	int32_t *ifr = NULL, *ivf = NULL;
+	int32_t *ifr = NULL, *ivf = NULL, *ptype = NULL, *pid = NULL;
 	SeekPoint *idx = NULL;
 	ParamNal *ps = NULL;
 	if (fread(&h, sizeof h, 1, f) != 1)
@@ -240,10 +243,14 @@ static int load_index_cache(MvcSource *s, const char *cpath, uint64_t src_size, 
 	if (h.nps) {
 		poff = malloc((size_t)h.nps * sizeof *poff);
 		plen = malloc((size_t)h.nps * sizeof *plen);
+		ptype = malloc((size_t)h.nps * sizeof *ptype);
+		pid = malloc((size_t)h.nps * sizeof *pid);
 		ps = malloc((size_t)h.nps * sizeof *ps);
-		if (!poff || !plen || !ps) goto done;
+		if (!poff || !plen || !ptype || !pid || !ps) goto done;
 		if (fread(poff, sizeof *poff, h.nps, f) != (size_t)h.nps ||
-		    fread(plen, sizeof *plen, h.nps, f) != (size_t)h.nps) goto done;
+		    fread(plen, sizeof *plen, h.nps, f) != (size_t)h.nps ||
+		    fread(ptype, sizeof *ptype, h.nps, f) != (size_t)h.nps ||
+		    fread(pid, sizeof *pid, h.nps, f) != (size_t)h.nps) goto done;
 	}
 	/* Validate the seek points as well as their byte offsets: seek_to binary-searches
 	 * idx[].valid_from assuming it is in range and strictly increasing, and trusts
@@ -267,10 +274,16 @@ static int load_index_cache(MvcSource *s, const char *cpath, uint64_t src_size, 
 		idx[i].frame = ifr[i];
 		idx[i].valid_from = ivf[i];
 	}
+	/* type/id need no range check: refeed_param_sets treats any value outside the
+	 * kinds/ids it knows as "cannot be deduped, feed it", so a corrupt pair costs a
+	 * redundant re-feed - never a dropped parameter set. The spans, which do form
+	 * pointers, are validated as before. */
 	for (int i = 0; i < h.nps; i++) {
 		if (poff[i] < 0 || plen[i] < 0 || (uint64_t)poff[i] + (uint64_t)plen[i] > src_size) goto done;
 		ps[i].nal = s->map + poff[i];
 		ps[i].end = s->map + poff[i] + plen[i];
+		ps[i].type = ptype[i];
+		ps[i].id = pid[i];
 	}
 	s->idx = idx; s->nidx = s->idxcap = h.nidx; idx = NULL; /* ownership transferred */
 	s->ps = ps; s->nps = s->pscap = h.nps; ps = NULL;
@@ -278,7 +291,7 @@ static int load_index_cache(MvcSource *s, const char *cpath, uint64_t src_size, 
 	s->info.is_mvc = h.is_mvc;
 	ok = 1;
 done:
-	free(ioff); free(ifr); free(ivf); free(poff); free(plen);
+	free(ioff); free(ifr); free(ivf); free(poff); free(plen); free(ptype); free(pid);
 	free(idx); free(ps); /* NULL after a successful transfer, so no double free */
 	fclose(f);
 	return ok;
@@ -305,6 +318,11 @@ static void save_index_cache(const MvcSource *s, const char *cpath, uint64_t src
 	for (int i = 0; i < s->nidx && ok; i++) { int32_t v = s->idx[i].valid_from;   ok = fwrite(&v, sizeof v, 1, f) == 1; }
 	for (int i = 0; i < s->nps && ok; i++) { int64_t o = s->ps[i].nal - s->map;   ok = fwrite(&o, sizeof o, 1, f) == 1; }
 	for (int i = 0; i < s->nps && ok; i++) { int64_t l = s->ps[i].end - s->ps[i].nal; ok = fwrite(&l, sizeof l, 1, f) == 1; }
+	/* type + id travel with the spans: a reopen must know which sets override which
+	 * without reading them back out of the file, since not touching those scattered
+	 * pages is the entire point (see refeed_param_sets). */
+	for (int i = 0; i < s->nps && ok; i++) { int32_t t = s->ps[i].type;         ok = fwrite(&t, sizeof t, 1, f) == 1; }
+	for (int i = 0; i < s->nps && ok; i++) { int32_t d = s->ps[i].id;           ok = fwrite(&d, sizeof d, 1, f) == 1; }
 	if (fclose(f) != 0) ok = 0;
 	if (!ok) remove(cpath);
 }
@@ -326,7 +344,7 @@ static void idx_push(MvcSource *s, const uint8_t *nal, int frame) {
 	s->nidx++;
 }
 
-static void ps_push(MvcSource *s, const uint8_t *nal, const uint8_t *end) {
+static void ps_push(MvcSource *s, const uint8_t *nal, const uint8_t *end, int type, int id) {
 	if (s->nps == s->pscap) {
 		int cap = s->pscap ? s->pscap * 2 : 16;
 		ParamNal *p = realloc(s->ps, (size_t)cap * sizeof *p);
@@ -335,6 +353,8 @@ static void ps_push(MvcSource *s, const uint8_t *nal, const uint8_t *end) {
 	}
 	s->ps[s->nps].nal = nal;
 	s->ps[s->nps].end = end;
+	s->ps[s->nps].type = type;
+	s->ps[s->nps].id = id;
 	s->nps++;
 }
 
@@ -452,7 +472,7 @@ static int scan_index_pass(MvcSource *s, int use_poc) {
 		else if (type == 8)
 			seen_pps = 1;
 		if (type == 7 || type == 8 || type == 13 || type == 15) /* SPS/PPS/SPS-ext/subset-SPS */
-			ps_push(s, p, nend);
+			ps_push(s, p, nend, type, h264_param_set_id(p, nend, type));
 		if (use_poc) {
 			/* Only the base SPS (7) feeds the POC parser, never the MVC subset SPS
 			 * (15): they share the id numbering but are distinct sets, so a subset
@@ -620,15 +640,55 @@ static int reset_decoder(MvcSource *s) {
 	return s->dec != NULL;
 }
 
-/* Re-establish, on a freshly recreated decoder, the parameter sets a linear
- * decode would have seen before `sp_nal`: feed every SPS/PPS/subset-SPS NAL that
- * appears earlier in the stream, in order (later ones override earlier ones with
- * the same id, exactly as in a linear decode). Needed for streams that carry the
- * parameter sets only at the start rather than repeating them per IDR. */
+/* Index into the per-kind override table below; -1 for a NAL type that is not a
+ * parameter set. SPS and subset SPS share the id numbering but are distinct sets,
+ * so they must not override each other and get separate rows. */
+static int ps_kind(int type) {
+	switch (type) {
+	case 7:  return 0; /* SPS           */
+	case 8:  return 1; /* PPS           */
+	case 13: return 2; /* SPS extension */
+	case 15: return 3; /* subset SPS    */
+	}
+	return -1;
+}
+
+/*
+ * Re-establish, on a freshly recreated decoder, the parameter sets a linear decode
+ * would have seen before `sp_nal`. Needed for streams that carry the parameter
+ * sets only at the start rather than repeating them per IDR.
+ *
+ * Only the sets still ACTIVE at sp_nal are fed: a later set with the same type and
+ * id overrides an earlier one, exactly as in a linear decode, so feeding just the
+ * last of each leaves the decoder in the identical state. That is not a
+ * micro-optimisation. The parameter sets are spread across the entire file, and a
+ * stream repeating them per IDR accumulates thousands - on a real 3D Blu-ray, 2173
+ * of them over 1.4 GB, of which 4 are active. Feeding all of them touches 2173
+ * scattered pages of a mapping the seek has otherwise never read (the on-disk
+ * index means the open no longer scans the file), so the cost is a random read per
+ * set: measured at 0.28 s of a 0.43 s cold seek here, and on a hard disk, at ~10 ms
+ * a seek, it would dominate everything else by an order of magnitude.
+ *
+ * A set whose id could not be parsed is always fed - dropping one a later slice
+ * needs would fail the decode, so the unknown case errs towards the old behaviour.
+ */
 static void refeed_param_sets(MvcSource *s, const uint8_t *sp_nal) {
 	if (!s->dec) return;
-	for (int i = 0; i < s->nps && s->ps[i].nal < sp_nal; i++)
-		edge264_decode_NAL(s->dec, s->ps[i].nal, s->ps[i].end, NULL, NULL);
+	int n = 0;
+	while (n < s->nps && s->ps[n].nal < sp_nal)
+		n++;
+	int32_t last[4][256]; /* last[kind][id] = index of the set that wins, or -1 */
+	memset(last, -1, sizeof last);
+	for (int i = 0; i < n; i++) {
+		int k = ps_kind(s->ps[i].type), id = s->ps[i].id;
+		if (k >= 0 && id >= 0 && id < 256)
+			last[k][id] = i;
+	}
+	for (int i = 0; i < n; i++) {
+		int k = ps_kind(s->ps[i].type), id = s->ps[i].id;
+		if (k < 0 || id < 0 || id >= 256 || last[k][id] == i)
+			edge264_decode_NAL(s->dec, s->ps[i].nal, s->ps[i].end, NULL, NULL);
+	}
 }
 
 /* Returns 0 on success, -1 if the decoder could not be reallocated (OOM). On

@@ -65,13 +65,19 @@ both hosts** (correct frame count, dimensions, frame-accurate seeking).
   A bounded decoded-frame cache (`cachesize`, default 512 MiB, modelled on
   BestSource's `cachesize`) holds independent frame copies that survive a decoder
   reset, so backward / repeat / `Reverse()` access is served from RAM (~0.2 ms)
-  instead of re-decoding at all. Frame-accurate and bit-exact against a sequential
-  decode across the full JVT conformance corpus and on real 3D Blu-rays. Measured
-  on a 7514-picture 3D Blu-ray at the defaults: a cold seek to the last frame
-  dropped from 4.25 s to 0.41 s, a `Reverse()` pass from 51.9 to ~155 fps, and the
-  worst single-frame stall - what a user perceives as a hang - from 2.21 s to
-  0.19 s. The gain is stream-dependent: a disc authored without recovery points
-  (one sample here) has no entry points between its IDRs and is unchanged.
+  instead of re-decoding at all. A seek also re-feeds only the parameter sets still
+  *active* at its target rather than every one preceding it: they are scattered
+  across the whole file and a stream repeating them per IDR accumulates thousands
+  (2173 on a real disc, of which 4 are active), so feeding all of them costs a
+  random read each - the more so the slower the storage. Frame-accurate and
+  bit-exact against a sequential decode across the full JVT conformance corpus and
+  on real 3D Blu-rays. Measured on a 7514-picture 3D Blu-ray at the defaults: a
+  cold seek to the last frame dropped from 4.25 s to 0.18 s (0.41 s from the
+  recovery points, 0.18 s once the re-feed was narrowed), a `Reverse()` pass from
+  51.9 to ~155 fps, and the worst single-frame stall - what a user perceives as a
+  hang - from 2.21 s to 0.19 s. The gain is stream-dependent: a disc authored
+  without recovery points (one sample here) has no entry points between its IDRs
+  and is unchanged.
 - [ ] VUI frame-rate auto-detection.
 
 ## Usage

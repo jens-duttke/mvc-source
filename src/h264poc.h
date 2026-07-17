@@ -201,6 +201,32 @@ static inline void h264_parse_sps(H264PocCtx *c, const uint8_t *nal, const uint8
 	c->sps[id] = s;
 }
 
+/*
+ * The id a parameter-set NAL declares, or -1 if it cannot be read. `type` is the
+ * NAL type: 7 (SPS), 8 (PPS), 13 (SPS extension) or 15 (subset SPS).
+ *
+ * Used to tell which parameter sets are still *active* at a given point, since a
+ * later set with the same type and id overrides an earlier one. That matters well
+ * beyond tidiness: a seek must re-feed the sets that precede its target, they are
+ * scattered across the whole file, and on a real 3D Blu-ray only 4 of 2173 are
+ * still active - so feeding all of them page-faults the entire mapping.
+ *
+ * An SPS and a subset SPS put the id behind the three fixed bytes profile_idc /
+ * constraint flags / level_idc; a PPS and an SPS extension lead with it.
+ */
+static inline int h264_param_set_id(const uint8_t *nal, const uint8_t *end, int type) {
+	uint8_t buf[64];
+	int n = h264_rbsp(nal, end, buf, sizeof buf);
+	H264Bits b;
+	h264_bits_init(&b, buf, n);
+	if (type == 7 || type == 15)
+		h264_un(&b, 24);
+	uint32_t id = h264_ue(&b);
+	if (b.err || id > 255)
+		return -1;
+	return (int)id;
+}
+
 /* Parse a PPS (NAL type 8). Only the first four fields matter here: the id, the
  * SPS it selects, and bottom_field_pic_order_in_frame_present_flag, which decides
  * whether delta_pic_order_cnt_bottom sits in the slice header. */
