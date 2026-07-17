@@ -38,9 +38,11 @@
  *                one: it shrinks the frame cache until nearly every reverse read
  *                is a cold seek onto a recovery point.
  *
- * The check is the project's core invariant: reading a frame after a seek must
- * be bit-identical to reading it in sequence. Reading every frame in reverse
- * order forces a backward seek onto each seek point in turn.
+ * The check is the project's core invariant: reading a frame after a seek must be
+ * bit-identical to reading it in sequence. Every topology is driven two ways:
+ * reading each frame in reverse from one source, and reading each frame from a
+ * fresh source (check_cold_seek). Only the second reaches the seek path at all -
+ * see the comment there.
  *
  * usage: seektest <base_multigop.264> [base_opengop.264]
  *
@@ -321,13 +323,16 @@ int main(int argc, char **argv) {
 	/* same stream, minimum cache: guards the cachesize plumbing + ring-cap sizing -
 	 * seek must stay bit-exact regardless of the cache budget */
 	fail |= check_seek_consistency_cache("base_mincache", base, (size_t)n, 16);
+	fail |= check_cold_seek("base_cold", base, (size_t)n);
 
 	Buf hc = synth(base, (size_t)n, 0);   /* headerless GOP  -> P4-H-1 */
 	fail |= check_seek_consistency("headerless", hc.p, hc.len);
+	fail |= check_cold_seek("headerless_cold", hc.p, hc.len);
 	free(hc.p);
 
 	Buf ab = synth(base, (size_t)n, 1);   /* AUD-headed once -> P4-M-1 */
 	fail |= check_seek_consistency("aud_once", ab.p, ab.len);
+	fail |= check_cold_seek("aud_once_cold", ab.p, ab.len);
 	free(ab.p);
 
 	/* mid-GOP cut: begins with VCL slices before any SPS/PPS (the Alba.264 case) */
@@ -336,6 +341,7 @@ int main(int argc, char **argv) {
 	else {
 		fail |= check_cut_count(base, (size_t)n, coff);
 		fail |= check_seek_consistency("cut", base + coff, (size_t)n - coff);
+		fail |= check_cold_seek("cut_cold", base + coff, (size_t)n - coff);
 	}
 
 	free(base);
