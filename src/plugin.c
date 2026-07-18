@@ -68,6 +68,12 @@ static void VS_CC vs_source_create(const VSMap *in, VSMap *out, void *userData,
 		vsapi->mapSetError(out, "mvc.Source: 'source' (path to an .264/.h264 Annex-B file) is required");
 		return;
 	}
+	/* dependent: optional MVC dependent-view stream (.mvc) when the 3D source was
+	 * demuxed into two separate elementary streams (base .264 + dependent .mvc),
+	 * as tsMuxeR / BD3D2MK3D produce. Omitted for a single already-combined MVC
+	 * stream. The two are interleaved in memory - no on-disk remux. */
+	const char *dependent = vsapi->mapGetData(in, "dependent", 0, &e);
+	if (e) dependent = NULL;
 	const char *stack = vsapi->mapGetData(in, "stack", 0, &e);
 	int layout = parse_layout(e ? NULL : stack);
 	if (layout < 0) {
@@ -118,7 +124,7 @@ static void VS_CC vs_source_create(const VSMap *in, VSMap *out, void *userData,
 	if (!have_num) { fpsnum = 0; fpsden = 0; }
 
 	char emsg[256];
-	MvcSource *src = mvc_open(source, threads, (MvcLayout)layout, swaplr, fpsnum, fpsden, cachesize, emsg, sizeof emsg);
+	MvcSource *src = mvc_open2(source, dependent, threads, (MvcLayout)layout, swaplr, fpsnum, fpsden, cachesize, emsg, sizeof emsg);
 	if (!src) {
 		char buf[320];
 		snprintf(buf, sizeof buf, "mvc.Source: %s", emsg);
@@ -159,9 +165,10 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
 		"H.264 MVC (3D) and AVC source, built on edge264-mvc",
 		VS_MAKE_VERSION(0, 4), VAPOURSYNTH_API_VERSION, 0, plugin);
 	/* New optional args are appended so existing positional calls keep their
-	 * indices (swaplr after the v0.1.0 set, cachesize after that). */
+	 * indices (swaplr after the v0.1.0 set, cachesize after that, dependent after
+	 * that). */
 	vspapi->registerFunction("Source",
-		"source:data;stack:data:opt;threads:int:opt;fpsnum:int:opt;fpsden:int:opt;swaplr:int:opt;cachesize:int:opt;",
+		"source:data;stack:data:opt;threads:int:opt;fpsnum:int:opt;fpsden:int:opt;swaplr:int:opt;cachesize:int:opt;dependent:data:opt;",
 		"clip:vnode;",
 		vs_source_create, NULL, plugin);
 }

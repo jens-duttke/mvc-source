@@ -1,5 +1,8 @@
 # build artifacts
 /coretest
+/twofiletest
+/.twofile_base.264
+/.twofile_dep.mvc
 /mockhost
 /mockhost-asan
 /avshost
@@ -27,7 +30,3 @@
 *.mp4
 *.mvcidx
 /build/
-
-# local working artifacts (audit output, not part of the published plugin)
-/AUDIT/
-/AUDIT_REPORT.md

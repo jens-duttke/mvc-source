@@ -47,7 +47,18 @@
  * target at all. Measured on a real 3D Blu-ray: 341 recovery points vs 103 IDRs,
  * and a cold decode from every one of them lands bit-exact on valid_from.
  */
-typedef struct { const uint8_t *nal; int frame, valid_from; } SeekPoint;
+typedef struct { const uint8_t *nal; int frame, valid_from; int nal_i; } SeekPoint;
+/* nal_i: index of the seek point's access-unit-start NAL in the interleaved span
+ * list, used only in two-file mode (see mvc_open2); -1 (unused) for a single
+ * contiguous stream, which repositions on the `nal` pointer instead. */
+
+/* One NAL unit of the logical (combined) stream: [start,end) is its bytes from
+ * the NAL header up to the next start code, exactly the range edge264_decode_NAL
+ * takes. In two-file mode the spans point alternately into the base-view and
+ * dependent-view mappings, in access-unit-interleaved decode order, so feeding
+ * them in sequence reconstructs the combined MVC stream without copying either
+ * file. */
+typedef struct { const uint8_t *start, *end; } NalSpan;
 
 /* A parameter-set NAL (SPS / PPS / SPS-extension / subset-SPS) span in the mapped
  * stream, in the order it appears. On a seek the decoder is torn down and
@@ -56,7 +67,10 @@ typedef struct { const uint8_t *nal; int frame, valid_from; } SeekPoint;
  * them per IDR. `type` is the NAL type and `id` the set's id (-1 if unreadable);
  * together they identify which sets a later one overrides, so a seek can re-feed
  * only those still active - see refeed_param_sets for why that is not just tidiness. */
-typedef struct { const uint8_t *nal, *end; int type, id; } ParamNal;
+typedef struct { const uint8_t *nal, *end; int type, id; int nal_i; } ParamNal;
+/* nal_i: as SeekPoint.nal_i - the set's position in the interleaved span list,
+ * so a two-file seek can re-feed only the sets preceding its target. -1 for a
+ * single contiguous stream, where the `nal` pointer's ordering serves instead. */
 
 /* A cached decoded source picture: an independent copy of the base (and, for
  * MVC, the dependent) view's packed planes, plus an Edge264Frame view over that
@@ -84,6 +98,14 @@ struct MvcSource {
 	size_t map_size;
 	const uint8_t *start;  /* first NAL (past the leading start code) */
 	const uint8_t *end;    /* one past the last byte */
+	/* Two-file mode (mvc_open2): a second mapping for the dependent-view stream,
+	 * and the interleaved NAL span list over both mappings that stands in for the
+	 * combined stream. `spans` is NULL in single-file mode, where the decoder feeds
+	 * directly off the one contiguous mapping (start..end) as before. */
+	uint8_t *map2;
+	size_t map2_size;
+	NalSpan *spans;
+	int nspans;
 	int n_threads;
 	size_t cache_budget;   /* decoded-frame cache ceiling in bytes (see ring_init) */
 	int swaplr;            /* emit the two views swapped (base <-> dependent) */
@@ -98,7 +120,8 @@ struct MvcSource {
 	int nps, pscap;
 
 	Edge264Decoder *dec;
-	const uint8_t *nal;    /* current feed position */
+	const uint8_t *nal;    /* current feed position (single-file mode) */
+	int feed_si;           /* current feed position as a span index (two-file mode) */
 	int next_out;          /* display index of the next frame get_frame will yield */
 	int valid_from;        /* display index from which this decode run's output is
 	                          correct: below it sit the leading pictures of the
@@ -273,6 +296,7 @@ static int load_index_cache(MvcSource *s, const char *cpath, uint64_t src_size, 
 		idx[i].nal = s->map + ioff[i];
 		idx[i].frame = ifr[i];
 		idx[i].valid_from = ivf[i];
+		idx[i].nal_i = -1; /* the on-disk cache is single-file only (see mvc_open2) */
 	}
 	/* type/id need no range check: refeed_param_sets treats any value outside the
 	 * kinds/ids it knows as "cannot be deduped, feed it", so a corrupt pair costs a
@@ -284,6 +308,7 @@ static int load_index_cache(MvcSource *s, const char *cpath, uint64_t src_size, 
 		ps[i].end = s->map + poff[i] + plen[i];
 		ps[i].type = ptype[i];
 		ps[i].id = pid[i];
+		ps[i].nal_i = -1; /* the on-disk cache is single-file only (see mvc_open2) */
 	}
 	s->idx = idx; s->nidx = s->idxcap = h.nidx; idx = NULL; /* ownership transferred */
 	s->ps = ps; s->nps = s->pscap = h.nps; ps = NULL;
@@ -341,6 +366,7 @@ static void idx_push(MvcSource *s, const uint8_t *nal, int frame) {
 	/* Correct as-is for an IDR (no leading pictures); flush_cvs refines it for an
 	 * open-GOP recovery point once that sequence's picture order counts are known. */
 	s->idx[s->nidx].valid_from = frame;
+	s->idx[s->nidx].nal_i = -1; /* single-file; the two-file build overwrites this */
 	s->nidx++;
 }
 
@@ -355,6 +381,7 @@ static void ps_push(MvcSource *s, const uint8_t *nal, const uint8_t *end, int ty
 	s->ps[s->nps].end = end;
 	s->ps[s->nps].type = type;
 	s->ps[s->nps].id = id;
+	s->ps[s->nps].nal_i = -1; /* single-file; the two-file build overwrites this */
 	s->nps++;
 }
 
@@ -581,18 +608,48 @@ static int check_display_order(MvcSource *s, const Edge264Frame *out, char *err,
 	return 1;
 }
 
+/* Peek the current NAL of the logical stream into [*buf,*e); *at_end is set when
+ * the feed is exhausted, and [*buf,*e) is then an empty range at a valid readable
+ * address (the flush sentinel). Single-file walks the one contiguous mapping via
+ * start codes exactly as before; two-file walks the interleaved span list, which
+ * already carries each NAL's [start,end) so no start-code scan is needed. */
+static void feed_peek(MvcSource *s, const uint8_t **buf, const uint8_t **e, int *at_end) {
+	if (s->spans) {
+		*at_end = s->feed_si >= s->nspans;
+		if (*at_end) {
+			const uint8_t *sent = s->nspans ? s->spans[s->nspans - 1].end : s->start;
+			*buf = *e = sent;
+		} else {
+			*buf = s->spans[s->feed_si].start;
+			*e = s->spans[s->feed_si].end;
+		}
+	} else {
+		*at_end = s->nal >= s->end;
+		*buf = *at_end ? s->end : s->nal;
+		*e = *at_end ? s->end : edge264_find_start_code(s->nal, s->end, 0);
+	}
+}
+
+/* Advance past the NAL feed_peek returned; `e` is that NAL's end (single-file). */
+static void feed_advance(MvcSource *s, const uint8_t *e) {
+	if (s->spans)
+		s->feed_si++;
+	else
+		s->nal = (e < s->end) ? e + 3 : s->end; /* avoid forming s->end + 3 (UB) */
+}
+
 static int decode_next_output(MvcSource *s, Edge264Frame *out, char *err, size_t errsize) {
 	if (edge264_get_frame(s->dec, out, 0) == 0)
 		return check_display_order(s, out, err, errsize) ? 1 : -1;
 	int stuck = 0;
 	for (;;) {
-		int at_end = s->nal >= s->end;
-		const uint8_t *buf = at_end ? s->end : s->nal;
-		const uint8_t *e = at_end ? s->end : edge264_find_start_code(s->nal, s->end, 0);
+		int at_end;
+		const uint8_t *buf, *e;
+		feed_peek(s, &buf, &e, &at_end);
 		int r = edge264_decode_NAL(s->dec, buf, e, NULL, NULL);
 		if (edge264_get_frame(s->dec, out, 0) == 0) {
 			if (r != ENOBUFS && !at_end)
-				s->nal = (e < s->end) ? e + 3 : s->end; /* avoid forming s->end + 3 (UB) */
+				feed_advance(s, e);
 			return check_display_order(s, out, err, errsize) ? 1 : -1;
 		}
 		if (r == ENOBUFS) {
@@ -621,7 +678,7 @@ static int decode_next_output(MvcSource *s, Edge264Frame *out, char *err, size_t
 			return 0; /* ENODATA: fully drained */
 		/* mirror scan_index's guard: e can be s->end (last NAL), and forming
 		 * s->end + 3 is UB (C11 6.5.6p8) even though it is only ever compared */
-		s->nal = (e < s->end) ? e + 3 : s->end; /* success / ENOTSUP skip / EBADMSG tolerate */
+		feed_advance(s, e); /* success / ENOTSUP skip / EBADMSG tolerate */
 	}
 }
 
@@ -672,11 +729,18 @@ static int ps_kind(int type) {
  * A set whose id could not be parsed is always fed - dropping one a later slice
  * needs would fail the decode, so the unknown case errs towards the old behaviour.
  */
-static void refeed_param_sets(MvcSource *s, const uint8_t *sp_nal) {
+static void refeed_param_sets(MvcSource *s, const uint8_t *sp_nal, int sp_i) {
 	if (!s->dec) return;
+	/* Count the parameter sets preceding the seek point. Both orderings are the
+	 * order the decoder would have seen the sets in a linear decode: a pointer
+	 * into the single mapping (single-file), or the position in the interleaved
+	 * span list (two-file), since the base- and dependent-view sets live in
+	 * different mappings and only their interleaved order is meaningful. */
 	int n = 0;
-	while (n < s->nps && s->ps[n].nal < sp_nal)
-		n++;
+	if (s->spans)
+		while (n < s->nps && s->ps[n].nal_i < sp_i) n++;
+	else
+		while (n < s->nps && s->ps[n].nal < sp_nal) n++;
 	int32_t last[4][256]; /* last[kind][id] = index of the set that wins, or -1 */
 	memset(last, -1, sizeof last);
 	for (int i = 0; i < n; i++) {
@@ -709,6 +773,7 @@ static int seek_to(MvcSource *s, int target) {
 	int sp_frame = best >= 0 ? s->idx[best].frame : 0;
 	int sp_valid = best >= 0 ? s->idx[best].valid_from : 0;
 	const uint8_t *sp_nal = best >= 0 ? s->idx[best].nal : s->start;
+	int sp_i = best >= 0 ? s->idx[best].nal_i : 0; /* span index of the restart NAL (two-file) */
 	/* Restart if we must go backwards, a closer seek point lies ahead, or the
 	 * decoder is absent - a prior seek's reset_decoder may have freed it and then
 	 * failed to reallocate (OOM), and without the NULL check an in-window forward
@@ -718,8 +783,11 @@ static int seek_to(MvcSource *s, int target) {
 	if (s->dec == NULL || target < s->next_out || sp_frame > s->next_out) {
 		if (!reset_decoder(s))
 			return -1;
-		refeed_param_sets(s, sp_nal);
-		s->nal = sp_nal;
+		refeed_param_sets(s, sp_nal, sp_i);
+		if (s->spans)
+			s->feed_si = sp_i;
+		else
+			s->nal = sp_nal;
 		s->next_out = sp_frame;
 		s->valid_from = sp_valid;
 	}
@@ -854,16 +922,158 @@ static void assemble_plane(const MvcSource *s, const Edge264Frame *f, int plane,
 	}
 }
 
+/* --- two-file (base + dependent view) interleaving ------------------------ */
+
+/* Does this NAL start a coded picture of its view? A base-view slice (1/5) has
+ * first_mb_in_slice ue(v)==0 as the top bit of its first RBSP byte; a dependent
+ * slice extension (20) carries a 3-byte nal_unit_header_mvc_extension first, so
+ * its slice header - and that same top bit - begins at byte offset 4. */
+static int nal_is_pic_start(const uint8_t *nal, const uint8_t *end, int type, int is_base) {
+	if (is_base)
+		return (type == 1 || type == 5) && (nal + 1 < end) && (nal[1] & 0x80);
+	return type == 20 && (nal + 4 < end) && (nal[4] & 0x80);
+}
+
+/* One NAL of a single view stream, tagged with the access unit it belongs to. */
+typedef struct { const uint8_t *start, *end; int type, au; } ViewNal;
+
+/*
+ * Walk one memory-mapped Annex-B view stream into its NAL units, grouped into
+ * access units. is_base selects the coded-picture NAL type(s): 1/5 (base view)
+ * or 20 (dependent view). A new access unit begins at the first leading (non-VCL)
+ * NAL after a picture, or at a picture-start VCL directly following another - the
+ * same boundary rule the single-file scan uses, so a NAL's leading parameter
+ * sets / prefix stay with the picture they precede.
+ *
+ * Returns a malloc'd array (caller frees) via *out with *n NALs across *n_au
+ * access units, or -1 on OOM, a missing start code, or an empty stream.
+ */
+static int collect_view_nals(const uint8_t *map, size_t map_size, int is_base,
+	ViewNal **out, int *n, int *n_au) {
+	*out = NULL; *n = 0; *n_au = 0;
+	if (map_size < 4) return -1;
+	if (!(map[0] == 0 && map[1] == 0 && (map[2] == 1 || (map[2] == 0 && map[3] == 1))))
+		return -1;
+	const uint8_t *p = map + 3 + (map[2] == 0);
+	const uint8_t *end = map + map_size;
+	ViewNal *arr = NULL;
+	int cnt = 0, cap = 0, cur_au = 0, seen_vcl = 0;
+	while (p < end) {
+		int type = p[0] & 0x1f;
+		const uint8_t *sc = edge264_find_start_code(p, end, 0);
+		const uint8_t *nend = sc < end ? sc : end;
+		int is_vcl = is_base ? (type == 1 || type == 5) : (type == 20);
+		int pic_start = nal_is_pic_start(p, nend, type, is_base);
+		/* leading NAL of the next AU, or back-to-back pictures with no leading NAL */
+		if (seen_vcl && (!is_vcl || pic_start)) { cur_au++; seen_vcl = 0; }
+		if (cnt == cap) {
+			cap = cap ? cap * 2 : 256;
+			ViewNal *t = realloc(arr, (size_t)cap * sizeof *t);
+			if (!t) { free(arr); return -1; }
+			arr = t;
+		}
+		arr[cnt].start = p; arr[cnt].end = nend; arr[cnt].type = type; arr[cnt].au = cur_au;
+		cnt++;
+		if (is_vcl) seen_vcl = 1;
+		p = (sc < end) ? sc + 3 : end;
+	}
+	if (cnt == 0) { free(arr); return -1; }
+	*out = arr; *n = cnt; *n_au = cur_au + 1;
+	return 0;
+}
+
+/*
+ * Build the interleaved NAL span list that stands in for the combined MVC stream,
+ * from the base-view mapping (s->map) and the dependent-view mapping (s->map2).
+ * Per access unit, the base view's NALs are emitted first, then the matching
+ * dependent view's NALs - the exact per-AU order a combined MVC elementary stream
+ * (what a 3D Blu-ray SSIF yields, and what the single-file path already decodes)
+ * carries. Verified bit-exact against that combined decode (tests/twofiletest.c).
+ *
+ * The scan is folded into this single pass: it counts base pictures, records the
+ * IDR seek points (span index of each IDR's access-unit start), collects the
+ * parameter sets from both views in interleaved order, and detects the dependent
+ * view. IDR-only seek points - see mvc_open2. Returns 0, or -1 (message in err).
+ */
+static int build_interleaved(MvcSource *s, char *err, size_t errsize) {
+	ViewNal *bn = NULL, *dn = NULL;
+	int nb = 0, nd = 0, nab = 0, nad = 0;
+	if (collect_view_nals(s->map, s->map_size, 1, &bn, &nb, &nab) < 0) {
+		set_err(err, errsize, "base stream has no decodable NAL units");
+		return -1;
+	}
+	if (collect_view_nals(s->map2, s->map2_size, 0, &dn, &nd, &nad) < 0) {
+		set_err(err, errsize, "dependent stream has no decodable NAL units");
+		free(bn);
+		return -1;
+	}
+	s->spans = malloc((size_t)(nb + nd) * sizeof *s->spans);
+	if (!s->spans) { set_err(err, errsize, "out of memory"); free(bn); free(dn); return -1; }
+
+	int n_au = nab > nad ? nab : nad;
+	int bi = 0, di = 0, si = 0;
+	int frames = 0, is_mvc = 0, seen_sps = 0, seen_pps = 0;
+	for (int au = 0; au < n_au; au++) {
+		int au_start_si = si, is_idr = 0, has_pic = 0;
+		for (; bi < nb && bn[bi].au == au; bi++, si++) {
+			int type = bn[bi].type;
+			s->spans[si].start = bn[bi].start;
+			s->spans[si].end = bn[bi].end;
+			if (type == 7) seen_sps = 1;
+			else if (type == 8) seen_pps = 1;
+			if (type == 7 || type == 8 || type == 13 || type == 15) {
+				int before = s->nps;
+				ps_push(s, bn[bi].start, bn[bi].end, type, h264_param_set_id(bn[bi].start, bn[bi].end, type));
+				if (s->nps > before) s->ps[s->nps - 1].nal_i = si; /* guard: ps_push no-ops on OOM */
+			}
+			if (type == 15) is_mvc = 1;
+			if ((type == 1 || type == 5) && seen_sps && seen_pps &&
+			    nal_is_pic_start(bn[bi].start, bn[bi].end, type, 1)) {
+				has_pic = 1;
+				if (type == 5) is_idr = 1;
+			}
+		}
+		for (; di < nd && dn[di].au == au; di++, si++) {
+			int type = dn[di].type;
+			s->spans[si].start = dn[di].start;
+			s->spans[si].end = dn[di].end;
+			if (type == 7 || type == 8 || type == 13 || type == 15) {
+				int before = s->nps;
+				ps_push(s, dn[di].start, dn[di].end, type, h264_param_set_id(dn[di].start, dn[di].end, type));
+				if (s->nps > before) s->ps[s->nps - 1].nal_i = si; /* guard: ps_push no-ops on OOM */
+			}
+			if (type == 20 || type == 15) is_mvc = 1;
+		}
+		if (has_pic) {
+			if (is_idr) {
+				int before = s->nidx;
+				idx_push(s, s->spans[au_start_si].start, frames);
+				if (s->nidx > before) s->idx[s->nidx - 1].nal_i = au_start_si; /* guard: idx_push no-ops on OOM */
+			}
+			frames++;
+		}
+	}
+	s->nspans = si;
+	free(bn);
+	free(dn);
+	if (frames <= 0) { set_err(err, errsize, "no decodable frames found in the base stream"); return -1; }
+	s->num_pics = frames;
+	s->info.is_mvc = is_mvc;
+	return 0;
+}
+
 /* --- public API ----------------------------------------------------------- */
 
 const MvcInfo *mvc_info(const MvcSource *s) { return &s->info; }
 
-MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swaplr,
-	int64_t fps_num, int64_t fps_den, int cachesize_mb, char *err, size_t errsize) {
+MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
+	MvcLayout layout, int swaplr, int64_t fps_num, int64_t fps_den,
+	int cachesize_mb, char *err, size_t errsize) {
 	if (layout < MVC_BASE || layout > MVC_ALT) { /* else assemble_plane's switch fills nothing */
 		set_err(err, errsize, "invalid layout");
 		return NULL;
 	}
+	int two_file = dep_path && dep_path[0];
 	MvcSource *s = calloc(1, sizeof *s);
 	if (!s) { set_err(err, errsize, "out of memory"); return NULL; }
 	s->n_threads = n_threads;
@@ -872,9 +1082,9 @@ MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swapl
 	s->swaplr = swaplr != 0;
 
 	int64_t src_mtime = 0;
-	s->map = map_file_ro(path, &s->map_size, &src_mtime);
+	s->map = map_file_ro(base_path, &s->map_size, &src_mtime);
 	if (!s->map) {
-		set_err(err, errsize, "cannot open input file");
+		set_err(err, errsize, two_file ? "cannot open base-view input file" : "cannot open input file");
 		free(s);
 		return NULL;
 	}
@@ -887,25 +1097,42 @@ MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swapl
 	s->start = b + 3 + (b[2] == 0);
 	s->end = b + s->map_size;
 
-	/* Skip the full-file scan when a matching sidecar index exists; otherwise
-	 * scan and (best-effort) write one for next time. See load_index_cache. */
-	char *cpath = malloc(strlen(path) + sizeof ".mvcidx");
-	int have_cache = 0;
-	if (cpath) {
-		snprintf(cpath, strlen(path) + sizeof ".mvcidx", "%s.mvcidx", path);
-		have_cache = load_index_cache(s, cpath, s->map_size, src_mtime);
-	}
-	if (!have_cache)
-		scan_index(s);
-	if (s->num_pics <= 0) {
+	if (two_file) {
+		/* Map the dependent view and interleave the two streams per access unit
+		 * into the span list the decoder feeds off (build_interleaved); the on-disk
+		 * index cache is single-file only, as its offsets are relative to one map. */
+		int64_t dep_mtime = 0;
+		s->map2 = map_file_ro(dep_path, &s->map2_size, &dep_mtime);
+		if (!s->map2) {
+			set_err(err, errsize, "cannot open dependent-view input file");
+			mvc_close(s);
+			return NULL;
+		}
+		if (build_interleaved(s, err, errsize) < 0) {
+			mvc_close(s);
+			return NULL;
+		}
+	} else {
+		/* Skip the full-file scan when a matching sidecar index exists; otherwise
+		 * scan and (best-effort) write one for next time. See load_index_cache. */
+		char *cpath = malloc(strlen(base_path) + sizeof ".mvcidx");
+		int have_cache = 0;
+		if (cpath) {
+			snprintf(cpath, strlen(base_path) + sizeof ".mvcidx", "%s.mvcidx", base_path);
+			have_cache = load_index_cache(s, cpath, s->map_size, src_mtime);
+		}
+		if (!have_cache)
+			scan_index(s);
+		if (s->num_pics <= 0) {
+			free(cpath);
+			set_err(err, errsize, "no decodable frames found");
+			mvc_close(s);
+			return NULL;
+		}
+		if (!have_cache && cpath)
+			save_index_cache(s, cpath, s->map_size, src_mtime);
 		free(cpath);
-		set_err(err, errsize, "no decodable frames found");
-		mvc_close(s);
-		return NULL;
 	}
-	if (!have_cache && cpath)
-		save_index_cache(s, cpath, s->map_size, src_mtime);
-	free(cpath);
 	s->info.fps_num = fps_num > 0 ? fps_num : 24000;
 	s->info.fps_den = fps_den > 0 ? fps_den : 1001;
 	/* the two-view layouts need a dependent view; on a 2D stream they degrade to
@@ -924,7 +1151,8 @@ MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swapl
 	/* decode the first frame for exact (post-crop) per-view dimensions */
 	s->dec = edge264_alloc(n_threads, NULL, NULL, 0, NULL, NULL, NULL);
 	if (!s->dec) { set_err(err, errsize, "edge264_alloc failed"); mvc_close(s); return NULL; }
-	s->nal = s->start;
+	s->nal = s->start; /* single-file feed position */
+	s->feed_si = 0;    /* two-file feed position (span index) */
 	s->next_out = 0;
 	s->valid_from = 0; /* a decode from the stream's start has no leading pictures to discard */
 	s->last_poc = INT64_MIN;
@@ -952,6 +1180,11 @@ MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swapl
 	default:      s->info.width = f.width_Y; s->info.height = f.height_Y; break;
 	}
 	return s;
+}
+
+MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swaplr,
+	int64_t fps_num, int64_t fps_den, int cachesize_mb, char *err, size_t errsize) {
+	return mvc_open2(path, NULL, n_threads, layout, swaplr, fps_num, fps_den, cachesize_mb, err, errsize);
 }
 
 /* Ensure source picture `src_n` is available in s->cur: from the frame cache if
@@ -1027,6 +1260,8 @@ void mvc_close(MvcSource *s) {
 	ring_free(s);
 	free(s->idx);
 	free(s->ps);
+	free(s->spans);
 	unmap_file(s->map, s->map_size);
+	unmap_file(s->map2, s->map2_size); /* NULL/0 in single-file mode - unmap_file no-ops */
 	free(s);
 }

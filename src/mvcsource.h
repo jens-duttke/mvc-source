@@ -59,6 +59,26 @@ typedef struct {
 MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swaplr,
 	int64_t fps_num, int64_t fps_den, int cachesize_mb, char *err, size_t errsize);
 
+/*
+ * Like mvc_open, but for an MVC stream demuxed into two separate elementary
+ * streams: base_path is the base-view AVC stream (.264/.h264) and dep_path the
+ * MVC dependent-view stream (.mvc), as tsMuxeR / BD3D2MK3D produce them from a
+ * 3D Blu-ray. The two are interleaved per access unit in memory (no on-disk
+ * remux) into the single combined MVC stream the decoder expects. dep_path NULL
+ * or empty is exactly mvc_open (one already-combined stream); mvc_open is just
+ * that call. Both files are memory-mapped, so the combine costs only a NAL-span
+ * index, not a copy of the (multi-GB) streams.
+ *
+ * The two-file path indexes IDR seek points only (open-GOP recovery points need
+ * per-view picture-order-count derivation not modelled across two streams):
+ * correct everywhere, and optimal for the near-sequential access this feeds
+ * (decode-and-re-encode); a backward seek re-decodes from the preceding IDR.
+ * The on-disk index cache is single-file only and is skipped here.
+ */
+MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
+	MvcLayout layout, int swaplr, int64_t fps_num, int64_t fps_den,
+	int cachesize_mb, char *err, size_t errsize);
+
 const MvcInfo *mvc_info(const MvcSource *s);
 
 /*

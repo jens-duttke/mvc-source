@@ -78,6 +78,13 @@ both hosts** (correct frame count, dimensions, frame-accurate seeking).
   hang - from 2.21 s to 0.19 s. The gain is stream-dependent: a disc authored
   without recovery points (one sample here) has no entry points between its IDRs
   and is unchanged.
+- [x] **Two-file (split base + dependent view) input** - decode a 3D source that
+  was demuxed into two separate elementary streams (base `.264` + dependent
+  `.mvc`, as tsMuxeR / BD3D2MK3D produce) via the `dependent` argument, without an
+  on-disk remux. The two memory-mapped streams are interleaved per access unit
+  into the combined MVC stream the decoder expects; the seek index uses the base
+  view's IDRs. Bit-exact against the single-file (combined) decode of the same
+  stream across the JVT MVC conformance corpus, all layouts (`tests/twofiletest.c`).
 - [ ] VUI frame-rate auto-detection.
 
 ## Usage
@@ -92,6 +99,16 @@ dependent, base, dependent ... - twice the frames at twice the frame rate). On a
 swaps the two views in any layout (base <-> dependent), so a stream authored
 right-eye-first can be flipped without re-authoring.
 
+**Two input forms.** `source` is normally a single **combined** MVC elementary
+stream that already carries both views interleaved (what a 3D Blu-ray's `SSIF`
+yields). If instead the disc was demuxed into **two separate** elementary streams
+- a base-view `.264` and a dependent-view `.mvc`, as tsMuxeR / BD3D2MK3D produce -
+pass the dependent stream as the `dependent` argument. The two are interleaved in
+memory, per access unit, into the combined stream the decoder expects: no on-disk
+remux and no extra disk space, and (both files being memory-mapped) no copy of the
+multi-GB streams. Omitting `dependent` decodes `source` as a single stream (2D, or
+an already-combined MVC stream) exactly as before.
+
 ### VapourSynth
 
 ```python
@@ -102,10 +119,13 @@ core.std.LoadPlugin("/path/to/libvsmvc.so")
 # base + dependent views stacked top-and-bottom (full resolution per eye)
 clip = core.mvc.Source(r"movie.264", stack="tab")
 
+# two separate streams from a tsMuxeR demux (base .264 + dependent .mvc):
+clip = core.mvc.Source(r"base.264", dependent=r"dependent.mvc", stack="tab")
+
 # ... interpolate to 60000/1001 with vs-rife, then output/encode ...
 ```
 
-Signature: `core.mvc.Source(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=0, cachesize=512)`.
+Signature: `core.mvc.Source(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=0, cachesize=512, dependent="")`.
 `threads` is edge264's internal decode parallelism (`-1` auto-detect cores, `0`
 single-thread, or an explicit count); `cachesize` is the decoded-frame cache
 ceiling in MiB (raise it for smoother backward / `Reverse()` seeking on
@@ -118,9 +138,12 @@ LoadPlugin("/path/to/libavsmvc.so")
 
 # base + dependent views stacked top-and-bottom (full resolution per eye)
 MVCSource("movie.264", stack="tab")
+
+# two separate streams from a tsMuxeR demux (base .264 + dependent .mvc):
+MVCSource("base.264", dependent="dependent.mvc", stack="tab")
 ```
 
-Signature: `MVCSource(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=false, cachesize=512)`.
+Signature: `MVCSource(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=false, cachesize=512, dependent="")`.
 `threads` and `cachesize` behave as for the VapourSynth signature above.
 
 `fpsnum`/`fpsden` must be given together (edge264's public API does not expose

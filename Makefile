@@ -32,7 +32,7 @@ AVS_DLL   := libavsmvc.dll
 VS_DLL    := libvsmvc.dll
 
 .PHONY: all clean check check-bitexact check-avs
-all: coretest mockhost seektest enomemtest allocfailtest poctest h264poctest stalltest cachetest budgettest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
+all: coretest twofiletest mockhost seektest enomemtest allocfailtest poctest h264poctest stalltest cachetest budgettest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
 
 # edge264 as a self-contained static library. FORCE so the sub-make always runs
 # and decides up-to-dateness itself: a bare file target with no prerequisites is
@@ -97,6 +97,12 @@ $(VS_DLL): src/plugin.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 # Standalone decode-core test (no VapourSynth needed).
 coretest: tests/coretest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 	$(CC) $(CFLAGS) $(INCLUDES) tests/coretest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
+
+# Two-file (split base + dependent view) test: splits the combined TEST_FILE and
+# proves mvc_open2's in-memory interleaving decodes bit-exact to the single-file
+# (combined) decode. Needs an MVC TEST_FILE (no-ops on a 2D stream).
+twofiletest: tests/twofiletest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
+	$(CC) $(CFLAGS) $(INCLUDES) tests/twofiletest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
 # Windows cross-build of the core test (statically linked PE), for exercising the
 # Windows I/O shim under Wine (CI) or Windows without an AviSynth+ install. Built
@@ -187,7 +193,7 @@ avsnulltest: tests/avsnulltest.c src/avisynth_plugin.c src/mvcsource.c src/mvcso
 budgettest: tests/budgettest.c src/cache_budget.h
 	$(CC) $(CFLAGS) $(INCLUDES) tests/budgettest.c -o $@
 
-check: coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest h264poctest stalltest cachetest budgettest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
+check: coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfailtest poctest h264poctest stalltest cachetest budgettest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
 	@echo "== makefile behaviour (edge264 sub-make always delegated) =="
 	sh tests/mkcheck.sh "$(EDGE264_SRC)"
 	@echo "== seek regression (headerless-GOP / AUD-headed / open-GOP, committed fixtures) =="
@@ -226,6 +232,8 @@ endif
 	./coretest "$(TEST_FILE)" 4
 	@echo "== coretest dump-mode error handling =="
 	sh tests/dumperr.sh ./coretest "$(TEST_FILE)"
+	@echo "== two-file (split base + dependent view) == combined decode =="
+	./twofiletest "$(TEST_FILE)" .twofile_base.264 .twofile_dep.mvc
 	@echo "== plugin (mock VapourSynth host) =="
 	./mockhost ./$(PLUGIN) "$(TEST_FILE)" tab
 	@echo "== plugin failure-path leak check (LeakSanitizer) =="
@@ -275,5 +283,6 @@ endif
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264: OK" || { echo "MISMATCH"; exit 1; }
 
 clean:
-	rm -f coretest mockhost mockhost-asan seektest enomemtest allocfailtest poctest h264poctest stalltest cachetest budgettest budgettest32 avsnulltest avshost \
+	rm -f coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfailtest poctest h264poctest stalltest cachetest budgettest budgettest32 avsnulltest avshost \
+	    .twofile_base.264 .twofile_dep.mvc \
 	    $(PLUGIN) $(AVS_PLUGIN) $(AVS_DLL) $(VS_DLL) *.exe src/*.o

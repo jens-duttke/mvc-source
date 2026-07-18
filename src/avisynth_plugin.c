@@ -93,7 +93,7 @@ static void AVSC_CC mvc_cb_free_filter(AVS_FilterInfo *fi) {
 	mvc_close((MvcSource *)fi->user_data);
 }
 
-/* --- MVCSource(source[, stack, threads, fpsnum, fpsden, swaplr, cachesize]) - */
+/* MVCSource(source[, stack, threads, fpsnum, fpsden, swaplr, cachesize, dependent]) */
 
 static AVS_Value AVSC_CC Create_MVCSource(AVS_ScriptEnvironment *env, AVS_Value args, void *user_data) {
 	(void)user_data;
@@ -132,9 +132,15 @@ static AVS_Value AVSC_CC Create_MVCSource(AVS_ScriptEnvironment *env, AVS_Value 
 	 * Larger = fewer re-seeks on a backward / Reverse() pass over a long GOP. */
 	AVS_Value a_cachesize = avs_array_elt(args, 6);
 	int cachesize = avs_defined(a_cachesize) ? avs_as_int(a_cachesize) : 0;
+	/* dependent: optional MVC dependent-view stream (.mvc) when the 3D source was
+	 * demuxed into two separate elementary streams (base .264 + dependent .mvc),
+	 * as tsMuxeR / BD3D2MK3D produce. Omitted for a single already-combined MVC
+	 * stream. The two are interleaved in memory - no on-disk remux. */
+	AVS_Value a_dependent = avs_array_elt(args, 7);
+	const char *dependent = avs_defined(a_dependent) ? avs_as_string(a_dependent) : NULL;
 
 	char emsg[256];
-	MvcSource *src = mvc_open(source, threads, (MvcLayout)layout, swaplr, fpsnum, fpsden, cachesize, emsg, sizeof emsg);
+	MvcSource *src = mvc_open2(source, dependent, threads, (MvcLayout)layout, swaplr, fpsnum, fpsden, cachesize, emsg, sizeof emsg);
 	if (!src) {
 		char buf[320];
 		snprintf(buf, sizeof buf, "MVCSource: %s", emsg);
@@ -180,7 +186,7 @@ static AVS_Value AVSC_CC Create_MVCSource(AVS_ScriptEnvironment *env, AVS_Value 
 
 MVC_PLUGIN_EXPORT const char *AVSC_CC avisynth_c_plugin_init(AVS_ScriptEnvironment *env) {
 	avs_add_function(env, "MVCSource",
-		"[source]s[stack]s[threads]i[fpsnum]i[fpsden]i[swaplr]b[cachesize]i",
+		"[source]s[stack]s[threads]i[fpsnum]i[fpsden]i[swaplr]b[cachesize]i[dependent]s",
 		Create_MVCSource, 0);
 	return "MVCSource: H.264 MVC (3D) and AVC source, built on edge264-mvc";
 }
