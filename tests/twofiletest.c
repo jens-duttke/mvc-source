@@ -92,6 +92,67 @@ done:
 	return ok ? 0 : -1;
 }
 
+/* The two-file path caches its interleave next to the dependent stream
+ * (`<dep>.mvcidx`) so a reopen skips the full end-to-end scan of both streams.
+ * Check that the sidecar is written, that a reopen (which loads it) decodes
+ * identically to the fresh build, and that a corrupt sidecar is rejected and
+ * rebuilt rather than trusted. Uses MVC_ALT and the last frame so the exercised
+ * path spans both views and a backward seek. */
+static int test_cache(const char *base, const char *dep) {
+	char cpath[2048];
+	snprintf(cpath, sizeof cpath, "%s.mvcidx", dep);
+	remove(cpath);
+	char err[256] = "";
+
+	MvcSource *s = mvc_open2(base, dep, 0, MVC_ALT, 0, 0, 0, 0, err, sizeof err);
+	if (!s) { printf("FAIL[cache]: build open failed: %s\n", err); return -1; }
+	const MvcInfo *in = mvc_info(s);
+	int W = in->width, H = in->height, CW = W / 2, CH = H / 2, fr = in->num_frames - 1;
+	size_t ysz = (size_t)W * H, csz = (size_t)CW * CH;
+	uint8_t *aY = malloc(ysz), *aU = malloc(csz), *aV = malloc(csz);
+	uint8_t *bY = malloc(ysz), *bU = malloc(csz), *bV = malloc(csz);
+	int rc = 0;
+	if (!aY || !aU || !aV || !bY || !bU || !bV) { printf("FAIL[cache]: oom\n"); rc = -1; }
+	else if (get(s, fr, aY, aU, aV, W, CW)) rc = -1;
+	mvc_close(s);
+
+	FILE *cf = fopen(cpath, "rb");
+	if (!cf) { printf("FAIL[cache]: no sidecar written\n"); rc = -1; }
+	else { fclose(cf); if (!rc) printf("ok[cache]: sidecar written next to the dependent stream\n"); }
+
+	/* reopen: loads the sidecar, must decode identically */
+	if (!rc) {
+		MvcSource *s2 = mvc_open2(base, dep, 0, MVC_ALT, 0, 0, 0, 0, err, sizeof err);
+		if (!s2) { printf("FAIL[cache]: reopen failed: %s\n", err); rc = -1; }
+		else {
+			if (get(s2, fr, bY, bU, bV, W, CW) ||
+			    memcmp(aY, bY, ysz) || memcmp(aU, bU, csz) || memcmp(aV, bV, csz)) {
+				printf("FAIL[cache]: cached reopen differs from the fresh build\n"); rc = -1;
+			} else printf("ok[cache]: cached reopen bit-exact to the fresh build\n");
+			mvc_close(s2);
+		}
+	}
+
+	/* a corrupt sidecar must be rejected (rebuilt), never trusted */
+	if (!rc) {
+		FILE *w = fopen(cpath, "wb");
+		if (w) { fwrite("MVC2FI01\xff\xff\xff\xff garbage", 1, 24, w); fclose(w); }
+		MvcSource *s3 = mvc_open2(base, dep, 0, MVC_ALT, 0, 0, 0, 0, err, sizeof err);
+		if (!s3) { printf("FAIL[cache]: open over a corrupt sidecar failed: %s\n", err); rc = -1; }
+		else {
+			if (get(s3, fr, bY, bU, bV, W, CW) ||
+			    memcmp(aY, bY, ysz) || memcmp(aU, bU, csz) || memcmp(aV, bV, csz)) {
+				printf("FAIL[cache]: corrupt sidecar not rebuilt correctly\n"); rc = -1;
+			} else printf("ok[cache]: corrupt sidecar rejected and rebuilt\n");
+			mvc_close(s3);
+		}
+	}
+
+	remove(cpath);
+	free(aY); free(aU); free(aV); free(bY); free(bU); free(bV);
+	return rc;
+}
+
 int main(int argc, char **argv) {
 	if (argc < 4) {
 		fprintf(stderr, "usage: %s <combined.264> <base.264> <dependent.mvc>\n", argv[0]);
@@ -125,6 +186,8 @@ int main(int argc, char **argv) {
 	int rc = 0;
 	for (MvcLayout lay = MVC_BASE; lay <= MVC_ALT; lay++)
 		rc |= compare_layout(combined, base, dep, lay);
+
+	rc |= test_cache(base, dep);
 
 	printf(rc ? "RESULT: FAIL\n" : "RESULT: PASS (mvc_open2 bit-exact to the combined decode on a real demux)\n");
 	return rc ? 1 : 0;

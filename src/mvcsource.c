@@ -352,6 +352,176 @@ static void save_index_cache(const MvcSource *s, const char *cpath, uint64_t src
 	if (!ok) remove(cpath);
 }
 
+/* --- on-disk index cache (two-file mode) ---------------------------------- */
+
+/*
+ * Two-file mode (mvc_open2) has no single contiguous mapping, so the single-file
+ * sidecar above (offsets relative to one map) cannot describe it. This variant
+ * caches build_interleaved's result instead: the interleaved NAL span list (each
+ * span tagged with which of the two mappings it points into, plus its start/end
+ * offset in that mapping), and the seek points / parameter sets, which reference a
+ * span by its index (nal_i) rather than a raw pointer. Rebuilding from this touches
+ * only the sidecar - not the two multi-GB elementary streams - so a reopen is
+ * instant instead of a full end-to-end scan of both files (~3 min on a full 3D
+ * Blu-ray demux). Keyed on both files' size + mtime; either changing invalidates it.
+ * Written next to the dependent stream (`<dep>.mvcidx`), which uniquely identifies
+ * the pairing and is never opened single-file, so it cannot collide with a
+ * single-file `<base>.mvcidx`.
+ */
+#define MVCIDX2_MAGIC "MVC2FI01" /* bump the trailing digits to invalidate old two-file caches */
+
+struct idx_hdr2 {
+	char     magic[8];    /* MVCIDX2_MAGIC, no NUL */
+	uint64_t base_size;
+	int64_t  base_mtime;
+	uint64_t dep_size;
+	int64_t  dep_mtime;
+	int32_t  num_pics;
+	int32_t  is_mvc;
+	int32_t  nspans;      /* interleaved NAL spans */
+	int32_t  nidx;        /* seek points */
+	int32_t  nps;         /* parameter-set NALs */
+}; /* 48 bytes, naturally aligned */
+
+/* True if `p` points into the dependent-view mapping (map2) rather than the base
+ * (map). A NAL lies wholly in one file, so its start determines its end's map too. */
+static int span_in_dep(const MvcSource *s, const uint8_t *p) {
+	return s->map2 && p >= s->map2 && p < s->map2 + s->map2_size;
+}
+
+/* Load the two-file cache at cpath into s (spans/idx/ps/num_pics/is_mvc). Returns 1
+ * only if present, well-formed and matching both source files (size + mtime); any
+ * mismatch or I/O/format error returns 0 so the caller rebuilds via build_interleaved.
+ * Every offset is validated to lie within its mapping and every nal_i within the span
+ * list before a pointer is formed, so a corrupt cache cannot point the decoder out of
+ * bounds. */
+static int load_index_cache_2f(MvcSource *s, const char *cpath,
+	uint64_t base_size, int64_t base_mtime, uint64_t dep_size, int64_t dep_mtime) {
+	FILE *f = fopen(cpath, "rb");
+	if (!f) return 0;
+	struct idx_hdr2 h;
+	int ok = 0;
+	int8_t *smap = NULL;
+	int64_t *soff = NULL, *eoff = NULL;
+	int32_t *ifr = NULL, *ivf = NULL, *inl = NULL, *ptype = NULL, *pid = NULL, *pnl = NULL;
+	NalSpan *spans = NULL;
+	SeekPoint *idx = NULL;
+	ParamNal *ps = NULL;
+	if (fread(&h, sizeof h, 1, f) != 1)
+		goto done;
+	if (memcmp(h.magic, MVCIDX2_MAGIC, 8) != 0 ||
+	    h.base_size != base_size || h.base_mtime != base_mtime ||
+	    h.dep_size != dep_size || h.dep_mtime != dep_mtime ||
+	    h.num_pics <= 0 || h.nspans <= 0 || h.nidx < 0 || h.nps < 0)
+		goto done;
+	/* Caps guard a corrupt/hostile count. 1<<28 spans is far above any real stream
+	 * (a full movie is a few million) and keeps num_pics*2 (MVC_ALT) within int. */
+	if (h.nspans > (1 << 28) || h.nidx > (1 << 28) || h.nps > (1 << 26) || h.num_pics > (1 << 28))
+		goto done;
+	smap = malloc((size_t)h.nspans);
+	soff = malloc((size_t)h.nspans * sizeof *soff);
+	eoff = malloc((size_t)h.nspans * sizeof *eoff);
+	spans = malloc((size_t)h.nspans * sizeof *spans);
+	if (!smap || !soff || !eoff || !spans) goto done;
+	if (fread(smap, 1, (size_t)h.nspans, f) != (size_t)h.nspans ||
+	    fread(soff, sizeof *soff, h.nspans, f) != (size_t)h.nspans ||
+	    fread(eoff, sizeof *eoff, h.nspans, f) != (size_t)h.nspans)
+		goto done;
+	for (int i = 0; i < h.nspans; i++) {
+		if (smap[i] != 0 && smap[i] != 1) goto done;
+		uint8_t *base = smap[i] ? s->map2 : s->map;
+		uint64_t sz = smap[i] ? dep_size : base_size;
+		if (soff[i] < 0 || eoff[i] < soff[i] || (uint64_t)soff[i] >= sz || (uint64_t)eoff[i] > sz)
+			goto done;
+		spans[i].start = base + soff[i];
+		spans[i].end = base + eoff[i];
+	}
+	if (h.nidx) {
+		ifr = malloc((size_t)h.nidx * sizeof *ifr);
+		ivf = malloc((size_t)h.nidx * sizeof *ivf);
+		inl = malloc((size_t)h.nidx * sizeof *inl);
+		idx = malloc((size_t)h.nidx * sizeof *idx);
+		if (!ifr || !ivf || !inl || !idx) goto done;
+		if (fread(ifr, sizeof *ifr, h.nidx, f) != (size_t)h.nidx ||
+		    fread(ivf, sizeof *ivf, h.nidx, f) != (size_t)h.nidx ||
+		    fread(inl, sizeof *inl, h.nidx, f) != (size_t)h.nidx)
+			goto done;
+	}
+	int prev_frame = -1, prev_valid = -1;
+	for (int i = 0; i < h.nidx; i++) {
+		if (inl[i] < 0 || inl[i] >= h.nspans) goto done;
+		if (ifr[i] <= prev_frame || ifr[i] >= h.num_pics) goto done;
+		if (ivf[i] < ifr[i] || ivf[i] <= prev_valid || ivf[i] >= h.num_pics) goto done;
+		prev_frame = ifr[i];
+		prev_valid = ivf[i];
+		idx[i].nal = spans[inl[i]].start;
+		idx[i].frame = ifr[i];
+		idx[i].valid_from = ivf[i];
+		idx[i].nal_i = inl[i];
+	}
+	if (h.nps) {
+		ptype = malloc((size_t)h.nps * sizeof *ptype);
+		pid = malloc((size_t)h.nps * sizeof *pid);
+		pnl = malloc((size_t)h.nps * sizeof *pnl);
+		ps = malloc((size_t)h.nps * sizeof *ps);
+		if (!ptype || !pid || !pnl || !ps) goto done;
+		if (fread(ptype, sizeof *ptype, h.nps, f) != (size_t)h.nps ||
+		    fread(pid, sizeof *pid, h.nps, f) != (size_t)h.nps ||
+		    fread(pnl, sizeof *pnl, h.nps, f) != (size_t)h.nps)
+			goto done;
+	}
+	for (int i = 0; i < h.nps; i++) {
+		if (pnl[i] < 0 || pnl[i] >= h.nspans) goto done;
+		ps[i].nal = spans[pnl[i]].start;
+		ps[i].end = spans[pnl[i]].end;
+		ps[i].type = ptype[i];
+		ps[i].id = pid[i];
+		ps[i].nal_i = pnl[i];
+	}
+	s->spans = spans; s->nspans = h.nspans; spans = NULL;
+	s->idx = idx; s->nidx = s->idxcap = h.nidx; idx = NULL;
+	s->ps = ps; s->nps = s->pscap = h.nps; ps = NULL;
+	s->num_pics = h.num_pics;
+	s->info.is_mvc = h.is_mvc;
+	ok = 1;
+done:
+	free(smap); free(soff); free(eoff);
+	free(ifr); free(ivf); free(inl); free(ptype); free(pid); free(pnl);
+	free(spans); free(idx); free(ps); /* NULL after a successful transfer, so no double free */
+	fclose(f);
+	return ok;
+}
+
+/* Write s's interleaved scan result to cpath (best-effort; same read-only-media and
+ * partial-write handling as the single-file save). */
+static void save_index_cache_2f(const MvcSource *s, const char *cpath,
+	uint64_t base_size, int64_t base_mtime, uint64_t dep_size, int64_t dep_mtime) {
+	FILE *f = fopen(cpath, "wb");
+	if (!f) return;
+	struct idx_hdr2 h;
+	memset(&h, 0, sizeof h);
+	memcpy(h.magic, MVCIDX2_MAGIC, 8);
+	h.base_size = base_size; h.base_mtime = base_mtime;
+	h.dep_size = dep_size; h.dep_mtime = dep_mtime;
+	h.num_pics = s->num_pics;
+	h.is_mvc = s->info.is_mvc;
+	h.nspans = s->nspans;
+	h.nidx = s->nidx;
+	h.nps = s->nps;
+	int ok = fwrite(&h, sizeof h, 1, f) == 1;
+	for (int i = 0; i < s->nspans && ok; i++) { int8_t m = span_in_dep(s, s->spans[i].start); ok = fwrite(&m, 1, 1, f) == 1; }
+	for (int i = 0; i < s->nspans && ok; i++) { int64_t o = s->spans[i].start - (span_in_dep(s, s->spans[i].start) ? s->map2 : s->map); ok = fwrite(&o, sizeof o, 1, f) == 1; }
+	for (int i = 0; i < s->nspans && ok; i++) { int64_t o = s->spans[i].end   - (span_in_dep(s, s->spans[i].start) ? s->map2 : s->map); ok = fwrite(&o, sizeof o, 1, f) == 1; }
+	for (int i = 0; i < s->nidx && ok; i++) { int32_t r = s->idx[i].frame;      ok = fwrite(&r, sizeof r, 1, f) == 1; }
+	for (int i = 0; i < s->nidx && ok; i++) { int32_t v = s->idx[i].valid_from; ok = fwrite(&v, sizeof v, 1, f) == 1; }
+	for (int i = 0; i < s->nidx && ok; i++) { int32_t n = s->idx[i].nal_i;      ok = fwrite(&n, sizeof n, 1, f) == 1; }
+	for (int i = 0; i < s->nps && ok; i++) { int32_t t = s->ps[i].type;  ok = fwrite(&t, sizeof t, 1, f) == 1; }
+	for (int i = 0; i < s->nps && ok; i++) { int32_t d = s->ps[i].id;    ok = fwrite(&d, sizeof d, 1, f) == 1; }
+	for (int i = 0; i < s->nps && ok; i++) { int32_t n = s->ps[i].nal_i; ok = fwrite(&n, sizeof n, 1, f) == 1; }
+	if (fclose(f) != 0) ok = 0;
+	if (!ok) remove(cpath);
+}
+
 /* --- NAL scan (indexing) -------------------------------------------------- */
 
 static void idx_push(MvcSource *s, const uint8_t *nal, int frame) {
@@ -1098,9 +1268,11 @@ MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
 	s->end = b + s->map_size;
 
 	if (two_file) {
-		/* Map the dependent view and interleave the two streams per access unit
-		 * into the span list the decoder feeds off (build_interleaved); the on-disk
-		 * index cache is single-file only, as its offsets are relative to one map. */
+		/* Map the dependent view and interleave the two streams per access unit into
+		 * the span list the decoder feeds off. A matching sidecar (`<dep>.mvcidx`,
+		 * keyed on both files' size + mtime) skips the full end-to-end scan of both
+		 * multi-GB streams that build_interleaved otherwise does; on a miss we build
+		 * and (best-effort) write one. See load_index_cache_2f. */
 		int64_t dep_mtime = 0;
 		s->map2 = map_file_ro(dep_path, &s->map2_size, &dep_mtime);
 		if (!s->map2) {
@@ -1108,10 +1280,20 @@ MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
 			mvc_close(s);
 			return NULL;
 		}
-		if (build_interleaved(s, err, errsize) < 0) {
+		char *cpath = malloc(strlen(dep_path) + sizeof ".mvcidx");
+		int have_cache = 0;
+		if (cpath) {
+			snprintf(cpath, strlen(dep_path) + sizeof ".mvcidx", "%s.mvcidx", dep_path);
+			have_cache = load_index_cache_2f(s, cpath, s->map_size, src_mtime, s->map2_size, dep_mtime);
+		}
+		if (!have_cache && build_interleaved(s, err, errsize) < 0) {
+			free(cpath);
 			mvc_close(s);
 			return NULL;
 		}
+		if (!have_cache && cpath)
+			save_index_cache_2f(s, cpath, s->map_size, src_mtime, s->map2_size, dep_mtime);
+		free(cpath);
 	} else {
 		/* Skip the full-file scan when a matching sidecar index exists; otherwise
 		 * scan and (best-effort) write one for next time. See load_index_cache. */

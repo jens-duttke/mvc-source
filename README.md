@@ -46,7 +46,12 @@ both hosts** (correct frame count, dimensions, frame-accurate seeking).
   reopen dropped from a full-file scan to ~25 ms (the sidecar plus the first GOP),
   bit-identical output. Writing is best-effort (a read-only directory simply
   means no cache, never a failed open); a stale or corrupt sidecar is detected
-  and a fresh scan runs.
+  and a fresh scan runs. Two-file input (below) is cached the same way, in a
+  `<dependent>.mvcidx` sidecar that also stores which of the two streams each
+  interleaved NAL came from - this matters a lot there, because a two-file open
+  scans *both* elementary streams end to end, so on a full-movie demux (a 25 GB
+  base + 13 GB dependent) the first open reads ~38 GB and takes minutes, while a
+  cached reopen is ~0.4 s.
 - [x] **Random-access seeking on every recovery point + decoded-frame cache** - a
   seek decodes forward from the nearest preceding random-access point. Those are
   not only IDRs: an open-GOP **recovery point** (a non-IDR I picture behind a
