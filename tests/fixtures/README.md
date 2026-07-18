@@ -65,3 +65,37 @@ ffmpeg -f lavfi -i "testsrc2=size=64x64:rate=1:duration=20" \
     -x264-params "open-gop=1:bframes=2:b-adapt=0:aud=0:repeat-headers=1:annexb=1" \
     -f h264 base_opengop.264
 ```
+
+## `mvc_combined.264` + `mvc_base.264` + `mvc_dependent.mvc`
+
+A small **MVC (stereo)** stream and its **real demuxer split**, for `twofiletest`.
+`mvc_combined.264` is the single interleaved MVC elementary stream `mvc_open`
+decodes; `mvc_base.264` (a clean 2D-playable AVC stream) and `mvc_dependent.mvc`
+(subset SPS + the dependent view, carrying its own parameter sets and SEI) are the
+two files `mvc_open2` reads - exactly the pair a 3D-Blu-ray demuxer produces.
+`twofiletest` requires `mvc_open2(base, dependent)` to decode bit-exact to
+`mvc_open(combined)` across every layout.
+
+The split is a **real tsMuxeR demux**, not synthesised by NAL type. That matters:
+a demuxer routes each access unit's dependent-section parameter sets/SEI - which
+reuse the base NAL types 7/8/6 - to the dependent file, where they must precede
+their slices. A by-type split (an earlier version of this test) misrouted them to
+the base file and made `mvc_open2`'s dependent slices decode before their PPS,
+which failed the test even though `mvc_open2` is correct (proven bit-exact against
+FRIMSource on real BD3D2MK3D demuxes). Using a committed real demux removes that
+guesswork. Note `mvc_dependent.mvc` genuinely carries its own PPS (NAL type 8), so
+the fixture exercises that dependent-parameter-set path.
+
+Source: the JVT MVC conformance bitstream `MVCDS-4.264` (9 frames), copied here as
+`mvc_combined.264`. Regenerate the split with tsMuxeR (any version; track 1 is the
+MVC/dependent view, track 2 the AVC/base view):
+
+```sh
+# demux.meta:
+#   MUXOPT --demux
+#   V_MPEG4/ISO/AVC, "MVCDS-4.264", track=2
+#   V_MPEG4/ISO/MVC, "MVCDS-4.264", track=1
+tsMuxeR demux.meta out_dir/
+cp out_dir/MVCDS-4.track_2.264 mvc_base.264
+cp out_dir/MVCDS-4.track_1.mvc mvc_dependent.mvc
+```

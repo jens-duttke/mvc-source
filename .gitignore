@@ -1,8 +1,6 @@
 # build artifacts
 /coretest
 /twofiletest
-/.twofile_base.264
-/.twofile_dep.mvc
 /mockhost
 /mockhost-asan
 /avshost

@@ -212,6 +212,8 @@ check: coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfail
 	./cachetest tests/fixtures/base_multigop.264
 	@echo "== AviSynth+ get_frame OOM handling (stubbed host, committed fixture) =="
 	./avsnulltest tests/fixtures/base_multigop.264
+	@echo "== two-file (separate base + dependent view) == combined decode (committed real demux) =="
+	./twofiletest tests/fixtures/mvc_combined.264 tests/fixtures/mvc_base.264 tests/fixtures/mvc_dependent.mvc
 	@echo "== cache-budget sizing (64-bit, + 32-bit if -m32 is available) =="
 	./budgettest
 	@if printf 'int main(void){return 0;}' | $(CC) -m32 -x c - -o /dev/null 2>/dev/null; then \
@@ -232,8 +234,6 @@ endif
 	./coretest "$(TEST_FILE)" 4
 	@echo "== coretest dump-mode error handling =="
 	sh tests/dumperr.sh ./coretest "$(TEST_FILE)"
-	@echo "== two-file (split base + dependent view) == combined decode =="
-	./twofiletest "$(TEST_FILE)" .twofile_base.264 .twofile_dep.mvc
 	@echo "== plugin (mock VapourSynth host) =="
 	./mockhost ./$(PLUGIN) "$(TEST_FILE)" tab
 	@echo "== plugin failure-path leak check (LeakSanitizer) =="
@@ -284,5 +284,4 @@ endif
 
 clean:
 	rm -f coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfailtest poctest h264poctest stalltest cachetest budgettest budgettest32 avsnulltest avshost \
-	    .twofile_base.264 .twofile_dep.mvc \
 	    $(PLUGIN) $(AVS_PLUGIN) $(AVS_DLL) $(VS_DLL) *.exe src/*.o
