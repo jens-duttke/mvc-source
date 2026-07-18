@@ -373,12 +373,34 @@ static int frameN_hash(VSNode *node, int n, uint64_t *out) {
 	mock_freeFrame(fr);
 	return 0;
 }
-static int frame0_hash(VSNode *node, uint64_t *out) { return frameN_hash(node, 0, out); }
+
+/* Index of the first sampled frame whose base and right luma differ, or -1 if
+ * none of the samples do, or -2 on a getFrame failure. The base and right views
+ * of an MVC stream must differ *somewhere*, but not necessarily at frame 0: a 3D
+ * disc commonly opens on a zero-disparity fade or black frame whose two views are
+ * bit-identical (measured: 4 of 5 real 3D Blu-rays here). So a view-mapping test
+ * must probe a spread of frames, not just frame 0, or it flags a correct plugin.
+ * The spread is enough to hit disparity on any real stereo content while staying
+ * a handful of decodes. */
+static int first_disparate_frame(VSNode *base, VSNode *right, int numFrames) {
+	int probe[] = { 0, 1, 2, numFrames / 3, numFrames / 2, 2 * numFrames / 3, numFrames - 1 };
+	int prev = -1;
+	for (unsigned i = 0; i < sizeof probe / sizeof *probe; i++) {
+		int n = probe[i];
+		if (n < 0 || n >= numFrames || n == prev) continue; /* clamp + skip repeats on a short clip */
+		prev = n;
+		uint64_t hb = 0, hr = 0;
+		if (frameN_hash(base, n, &hb) || frameN_hash(right, n, &hr)) return -2;
+		if (hb != hr) return n;
+	}
+	return -1;
+}
 
 /* M5: the "right" stack (dependent view alone) must actually map to MVC_RIGHT
  * and serve a different view than "base". On an MVC stream base and right share
  * per-view dimensions but differ in content; a broken mapping (right -> base)
- * would make them identical. Detect MVC via the tab layout stacking to 2x. */
+ * would make them identical on every frame. Detect MVC via the tab layout
+ * stacking to 2x. */
 static void test_right_view(const char *path, int *fail) {
 	char err[512];
 	VSNode *b = call_source(path, "base", err, sizeof err);
@@ -391,13 +413,17 @@ static void test_right_view(const char *path, int *fail) {
 		*fail = 1;
 	}
 	int is_mvc = vit->height == 2 * vib->height; /* tab stacks base over dependent */
-	uint64_t hb = 0, hr = 0;
-	if (frame0_hash(b, &hb) || frame0_hash(r, &hr)) { printf("FAIL[right]: getFrame failed\n"); *fail = 1; goto done; }
-	if (is_mvc && hb == hr) {
-		printf("FAIL[right]: right view identical to base on an MVC stream (mapping broken?)\n"); *fail = 1;
+	if (!is_mvc) {
+		printf("ok[right]: 2D stream, right degrades to base\n");
+		goto done;
+	}
+	int fd = first_disparate_frame(b, r, vib->numFrames);
+	if (fd == -2) {
+		printf("FAIL[right]: getFrame failed\n"); *fail = 1;
+	} else if (fd < 0) {
+		printf("FAIL[right]: right identical to base on every sampled frame (mapping broken?)\n"); *fail = 1;
 	} else {
-		printf("ok[right]: right maps to the dependent view (mvc=%d, base=%016llx right=%016llx)\n",
-			is_mvc, (unsigned long long)hb, (unsigned long long)hr);
+		printf("ok[right]: right maps to the dependent view (differs from base at frame %d)\n", fd);
 	}
 done:
 	free_node(b); free_node(r); free_node(t);
@@ -458,9 +484,16 @@ static void test_swaplr(const char *path, int *fail) {
 	if (!b || !r || !t || !bs || !rs) { printf("FAIL[swaplr]: open failed: %s\n", err); *fail = 1; goto done; }
 	const VSVideoInfo *vib = mock_getVideoInfo(b), *vit = mock_getVideoInfo(t);
 	int is_mvc = vit->height == 2 * vib->height;
+	/* Test at a frame where the views actually differ: on a zero-disparity fade
+	 * (frame 0 of most 3D discs) base == right, so base+swaplr == right holds
+	 * trivially and a broken swaplr would slip through. On a 2D stream there is no
+	 * disparate frame; swaplr is a no-op there, so frame 0 is fine. */
+	int n = is_mvc ? first_disparate_frame(b, r, vib->numFrames) : 0;
+	if (n == -2) { printf("FAIL[swaplr]: getFrame failed\n"); *fail = 1; goto done; }
+	if (n < 0) { printf("FAIL[swaplr]: base and right identical on every sampled frame\n"); *fail = 1; goto done; }
 	uint64_t hb = 0, hr = 0, hbs = 0, hrs = 0;
-	if (frameN_hash(b, 0, &hb) || frameN_hash(r, 0, &hr) ||
-	    frameN_hash(bs, 0, &hbs) || frameN_hash(rs, 0, &hrs)) {
+	if (frameN_hash(b, n, &hb) || frameN_hash(r, n, &hr) ||
+	    frameN_hash(bs, n, &hbs) || frameN_hash(rs, n, &hrs)) {
 		printf("FAIL[swaplr]: getFrame failed\n"); *fail = 1; goto done;
 	}
 	int bad = 0;
@@ -470,7 +503,7 @@ static void test_swaplr(const char *path, int *fail) {
 	} else if (hbs != hb) {
 		printf("FAIL[swaplr]: 2D base+swaplr changed the view\n"); bad = 1;
 	}
-	if (bad) *fail = 1; else printf("ok[swaplr]: swaps the two views (mvc=%d)\n", is_mvc);
+	if (bad) *fail = 1; else printf("ok[swaplr]: swaps the two views (mvc=%d, frame %d)\n", is_mvc, n);
 done:
 	free_node(b); free_node(r); free_node(t); free_node(bs); free_node(rs);
 }
