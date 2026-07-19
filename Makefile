@@ -14,6 +14,9 @@
 CC        ?= cc
 # MinGW dlltool for the Windows cross-build's import library (see $(AVS_DLL)).
 DLLTOOL   ?= x86_64-w64-mingw32-dlltool
+# MinGW resource compiler for the Windows cross-build's version resource (see
+# $(AVS_DLL)/$(VS_DLL) and src/version.rc.in).
+WINDRES   ?= x86_64-w64-mingw32-windres
 # Preference flags only (a user/CI CFLAGS override replaces these). The
 # semantically-required -fPIC for the shared object lives in the $(PLUGIN) rule,
 # so an override cannot silently drop it. Everything here is C - both plugins and
@@ -31,6 +34,20 @@ AVS_PLUGIN := libavsmvc.so
 AVS_DLL   := libavsmvc.dll
 VS_DLL    := libvsmvc.dll
 
+# Single source of truth for the project version: the VapourSynth plugin's
+# reported version (VS_MAKE_VERSION in plugin.c) and both Windows DLLs' embedded
+# PE version resource (FileVersion/ProductVersion/... - what Explorer's
+# Properties > Details tab reads) all derive from this one file, so they cannot
+# drift the way tests.yml's and release.yml's EDGE264_REF once did (see
+# .claude/CLAUDE.md). Passed as -D defines rather than folded into CFLAGS so a
+# user/CI CFLAGS override cannot silently drop them (same reasoning as -fPIC
+# above) - plugin.c requires MVC_VERSION_MAJOR/MINOR to build.
+VERSION       := $(shell cat VERSION)
+VERSION_MAJOR := $(word 1,$(subst ., ,$(VERSION)))
+VERSION_MINOR := $(word 2,$(subst ., ,$(VERSION)))
+VERSION_PATCH := $(word 3,$(subst ., ,$(VERSION)))
+VERSION_CFLAGS := -DMVC_VERSION_MAJOR=$(VERSION_MAJOR) -DMVC_VERSION_MINOR=$(VERSION_MINOR)
+
 .PHONY: all clean check check-bitexact check-avs
 all: coretest twofiletest mockhost seektest enomemtest allocfailtest poctest h264poctest stalltest cachetest budgettest avsnulltest $(PLUGIN) $(AVS_PLUGIN)
 
@@ -46,7 +63,7 @@ FORCE: ;
 # The VapourSynth plugin: only VapourSynthPluginInit2 is exported; edge264's
 # symbols are hidden so the plugin cannot clash with another that links it too.
 $(PLUGIN): src/plugin.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
-	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden $(INCLUDES) -shared \
+	$(CC) $(CFLAGS) $(VERSION_CFLAGS) -fPIC -fvisibility=hidden $(INCLUDES) -shared \
 	    src/plugin.c src/mvcsource.c $(EDGE264_A) -pthread \
 	    -Wl,--exclude-libs,ALL -o $@
 
@@ -76,12 +93,25 @@ $(AVS_PLUGIN): src/avisynth_plugin.c src/mvcsource.c src/mvcsource.h $(EDGE264_A
 # AviSynth.dll, which the host resolves at load time. __declspec(dllexport) on
 # avisynth_c_plugin_init exports only that entry; edge264 stays hidden. -static*
 # link libgcc/winpthread in, so the .dll depends only on KERNEL32/msvcrt/AviSynth.
-$(AVS_DLL): src/avisynth_plugin.c src/mvcsource.c src/mvcsource.h src/avisynth_win.def $(EDGE264_A)
+# avisynth_version.o embeds the PE version resource (see src/version.rc.in) -
+# AviSynth has no API to query a filter DLL's version at runtime (unlike
+# VapourSynth's core.version()), so this is the only way a user can tell.
+$(AVS_DLL): src/avisynth_plugin.c src/mvcsource.c src/mvcsource.h src/avisynth_win.def avisynth_version.o $(EDGE264_A)
 	$(DLLTOOL) -d src/avisynth_win.def -D AviSynth.dll -l avisynth.dll.a
 	$(CC) $(CFLAGS) -Wno-missing-field-initializers $(INCLUDES) -shared \
-	    src/avisynth_plugin.c src/mvcsource.c $(EDGE264_A) avisynth.dll.a \
+	    src/avisynth_plugin.c src/mvcsource.c avisynth_version.o $(EDGE264_A) avisynth.dll.a \
 	    -static -static-libgcc -pthread -o $@
 	rm -f avisynth.dll.a
+
+avisynth_version.rc: src/version.rc.in VERSION
+	sed -e 's/@VER_MAJOR@/$(VERSION_MAJOR)/g' -e 's/@VER_MINOR@/$(VERSION_MINOR)/g' \
+	    -e 's/@VER_PATCH@/$(VERSION_PATCH)/g' -e 's/@VER_STRING@/$(VERSION)/g' \
+	    -e 's/@VER_FILENAME@/$(AVS_DLL)/g' \
+	    -e 's/@VER_DESCRIPTION@/AviSynth+ MVC (3D Blu-ray) source filter/g' \
+	    $< > $@
+
+avisynth_version.o: avisynth_version.rc
+	$(WINDRES) $< $@
 
 # Windows cross-build of the VapourSynth plugin (.dll). Same MinGW invocation as
 # libavsmvc.dll (CC/EDGE264_SRC/EDGE264_MAKE). Unlike the AviSynth DLL the plugin
@@ -89,10 +119,23 @@ $(AVS_DLL): src/avisynth_plugin.c src/mvcsource.c src/mvcsource.h src/avisynth_w
 # VapourSynthPluginInit2 - so there is no import .def / dlltool step; the export
 # comes from VS_EXTERNAL_API's __declspec(dllexport) on Windows. -static* fold
 # libgcc/winpthread in, so the .dll depends only on KERNEL32/msvcrt.
-$(VS_DLL): src/plugin.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
-	$(CC) $(CFLAGS) $(INCLUDES) -shared \
-	    src/plugin.c src/mvcsource.c $(EDGE264_A) \
+# vapoursynth_version.o embeds the PE version resource (see src/version.rc.in) -
+# redundant with core.version() but keeps Explorer's Properties tab consistent
+# with the AviSynth+ .dll, which has no runtime version query at all.
+$(VS_DLL): src/plugin.c src/mvcsource.c src/mvcsource.h vapoursynth_version.o $(EDGE264_A)
+	$(CC) $(CFLAGS) $(VERSION_CFLAGS) $(INCLUDES) -shared \
+	    src/plugin.c src/mvcsource.c vapoursynth_version.o $(EDGE264_A) \
 	    -static -static-libgcc -pthread -o $@
+
+vapoursynth_version.rc: src/version.rc.in VERSION
+	sed -e 's/@VER_MAJOR@/$(VERSION_MAJOR)/g' -e 's/@VER_MINOR@/$(VERSION_MINOR)/g' \
+	    -e 's/@VER_PATCH@/$(VERSION_PATCH)/g' -e 's/@VER_STRING@/$(VERSION)/g' \
+	    -e 's/@VER_FILENAME@/$(VS_DLL)/g' \
+	    -e 's/@VER_DESCRIPTION@/VapourSynth MVC (3D Blu-ray) source filter/g' \
+	    $< > $@
+
+vapoursynth_version.o: vapoursynth_version.rc
+	$(WINDRES) $< $@
 
 # Standalone decode-core test (no VapourSynth needed).
 coretest: tests/coretest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
@@ -284,4 +327,4 @@ endif
 
 clean:
 	rm -f coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfailtest poctest h264poctest stalltest cachetest budgettest budgettest32 avsnulltest avshost \
-	    $(PLUGIN) $(AVS_PLUGIN) $(AVS_DLL) $(VS_DLL) *.exe src/*.o
+	    $(PLUGIN) $(AVS_PLUGIN) $(AVS_DLL) $(VS_DLL) avisynth_version.rc avisynth_version.o vapoursynth_version.rc vapoursynth_version.o *.exe src/*.o
