@@ -93,8 +93,13 @@ both hosts** (correct frame count, dimensions, frame-accurate seeking).
   recovery points, exactly as for a combined stream: the POC derivation behind
   recovery-point seeking is a base-view quantity, so it runs on the base stream's
   slice headers alone (with the same IDR-only fallback for streams it cannot
-  model). Bit-exact against the single-file (combined) decode of the same stream
-  on a real tsMuxeR demux, all layouts, including cold seeks (`tests/twofiletest.c`).
+  model). A pair cut mid-stream can begin with an orphan dependent access unit
+  whose base picture lies before the cut; the interleave detects it (the base
+  stream starts at an IDR, whose dependent counterpart must be an anchor
+  picture) and keeps the base/dependent pairing aligned instead of shifting
+  every dependent view by one. Bit-exact against the single-file (combined)
+  decode of the same stream on a real tsMuxeR demux, all layouts, including
+  cold seeks (`tests/twofiletest.c`).
 - [ ] VUI frame-rate auto-detection.
 
 ## Usage

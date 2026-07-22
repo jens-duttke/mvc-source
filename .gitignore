@@ -27,4 +27,5 @@
 *.y4m
 *.mp4
 *.mvcidx
+*.orphan.mvc
 /build/

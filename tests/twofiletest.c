@@ -136,7 +136,7 @@ static int test_cache(const char *base, const char *dep) {
 	/* a corrupt sidecar must be rejected (rebuilt), never trusted */
 	if (!rc) {
 		FILE *w = fopen(cpath, "wb");
-		if (w) { fwrite("MVC2FI02\xff\xff\xff\xff garbage", 1, 24, w); fclose(w); }
+		if (w) { fwrite("MVC2FI03\xff\xff\xff\xff garbage", 1, 24, w); fclose(w); }
 		MvcSource *s3 = mvc_open2(base, dep, 0, MVC_ALT, 0, 0, 0, 0, err, sizeof err);
 		if (!s3) { printf("FAIL[cache]: open over a corrupt sidecar failed: %s\n", err); rc = -1; }
 		else {
@@ -194,6 +194,90 @@ done:
 	return rc;
 }
 
+/* A pair cut mid-stream can begin with an ORPHAN dependent AU whose base picture
+ * lies before the cut; index-pairing the AU sequences would then shift every
+ * dependent view by one (seen on a real chapter cut). Simulate it: prepend a
+ * non-anchor dependent AU (taken from the middle of the committed dependent
+ * stream) to a temp copy and require the decode to still match the combined
+ * stream bit-exactly - the core must detect the orphan (base starts at an IDR,
+ * whose dependent counterpart must be an anchor) and keep the pairing aligned. */
+static int test_orphan_head(const char *combined, const char *base, const char *dep) {
+	FILE *f = fopen(dep, "rb");
+	if (!f) { printf("FAIL[orphan]: cannot open %s\n", dep); return -1; }
+	fseek(f, 0, SEEK_END);
+	long sz = ftell(f);
+	rewind(f);
+	uint8_t *d = malloc((size_t)sz);
+	if (!d || fread(d, 1, (size_t)sz, f) != (size_t)sz) { printf("FAIL[orphan]: read\n"); free(d); fclose(f); return -1; }
+	fclose(f);
+
+	/* locate the picture-start type-20 NALs (first_mb flag sits after the 3-byte
+	 * MVC extension header); the orphan is the THIRD dependent picture - the
+	 * committed fixture's first non-anchor (its first two are anchors), i.e. a
+	 * mid-GOP AU, exactly what a cut leaves behind */
+	long ps[4], nps = 0;
+	for (long p = 0; p + 3 < sz && nps < 4; p++) {
+		if (!(d[p] == 0 && d[p+1] == 0 && d[p+2] == 1)) continue;
+		long h = p + 3;
+		if ((d[h] & 0x1f) == 20 && h + 4 < sz && (d[h+4] & 0x80))
+			ps[nps++] = p;
+		p = h; /* skip the start code */
+	}
+	if (nps < 4) { printf("skip[orphan]: fewer than 4 dependent pictures\n"); free(d); return 0; }
+	/* the orphan must be a non-anchor (anchor_pic_flag, bit 2 of the 3rd MVC
+	 * extension byte - no emulation bytes in the fixture's extension headers) */
+	if ((d[ps[2] + 3 + 3] >> 2) & 1) { printf("skip[orphan]: third dependent picture is an anchor\n"); free(d); return 0; }
+
+	char tmp[2048], cpath[2064];
+	snprintf(tmp, sizeof tmp, "%s.orphan.mvc", dep);
+	snprintf(cpath, sizeof cpath, "%s.mvcidx", tmp);
+	FILE *w = fopen(tmp, "wb");
+	int rc = 0;
+	if (!w || fwrite(d + ps[2], 1, (size_t)(ps[3] - ps[2]), w) != (size_t)(ps[3] - ps[2]) ||
+	    fwrite(d, 1, (size_t)sz, w) != (size_t)sz || fclose(w) != 0) {
+		printf("FAIL[orphan]: cannot write %s\n", tmp);
+		if (w) fclose(w);
+		free(d);
+		remove(tmp);
+		return -1;
+	}
+	free(d);
+
+	char err[256] = "";
+	MvcSource *sc = mvc_open(combined, 0, MVC_TAB, 0, 0, 0, 0, err, sizeof err);
+	MvcSource *st = sc ? mvc_open2(base, tmp, 0, MVC_TAB, 0, 0, 0, 0, err, sizeof err) : NULL;
+	if (!sc || !st) { printf("FAIL[orphan]: open failed: %s\n", err); rc = -1; }
+	if (!rc) {
+		const MvcInfo *ic = mvc_info(sc), *it = mvc_info(st);
+		if (ic->num_frames != it->num_frames) {
+			printf("FAIL[orphan]: frame count %d != combined %d (orphan not excluded)\n",
+				it->num_frames, ic->num_frames);
+			rc = -1;
+		} else {
+			int W = ic->width, H = ic->height, CW = W / 2, CH = H / 2;
+			size_t ysz = (size_t)W * H, csz = (size_t)CW * CH;
+			uint8_t *cY = malloc(ysz), *cU = malloc(csz), *cV = malloc(csz);
+			uint8_t *tY = malloc(ysz), *tU = malloc(csz), *tV = malloc(csz);
+			if (!cY || !cU || !cV || !tY || !tU || !tV) { printf("FAIL[orphan]: oom\n"); rc = -1; }
+			for (int i = 0; i < ic->num_frames && !rc; i++) {
+				if (get(sc, i, cY, cU, cV, W, CW) || get(st, i, tY, tU, tV, W, CW)) { rc = -1; break; }
+				if (memcmp(cY, tY, ysz) || memcmp(cU, tU, csz) || memcmp(cV, tV, csz)) {
+					printf("FAIL[orphan]: frame %d differs with an orphan-headed dependent stream\n", i);
+					rc = -1;
+				}
+			}
+			free(cY); free(cU); free(cV); free(tY); free(tU); free(tV);
+			if (!rc)
+				printf("ok[orphan]: leading orphan dependent AU excluded, %d frames bit-exact\n", ic->num_frames);
+		}
+	}
+	if (st) mvc_close(st);
+	if (sc) mvc_close(sc);
+	remove(tmp);
+	remove(cpath);
+	return rc;
+}
+
 int main(int argc, char **argv) {
 	if (argc < 4) {
 		fprintf(stderr, "usage: %s <combined.264> <base.264> <dependent.mvc>\n", argv[0]);
@@ -229,6 +313,7 @@ int main(int argc, char **argv) {
 		rc |= compare_layout(combined, base, dep, lay);
 
 	rc |= test_cold_seeks(combined, base, dep);
+	rc |= test_orphan_head(combined, base, dep);
 	rc |= test_cache(base, dep);
 
 	printf(rc ? "RESULT: FAIL\n" : "RESULT: PASS (mvc_open2 bit-exact to the combined decode on a real demux)\n");

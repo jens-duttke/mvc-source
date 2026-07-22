@@ -368,7 +368,7 @@ static void save_index_cache(const MvcSource *s, const char *cpath, uint64_t src
  * the pairing and is never opened single-file, so it cannot collide with a
  * single-file `<base>.mvcidx`.
  */
-#define MVCIDX2_MAGIC "MVC2FI02" /* bump the trailing digits to invalidate old two-file caches (02: seek points now include open-GOP recovery points; an 01 sidecar is still correct but IDR-only, and keeping it would silently withhold the faster seeking) */
+#define MVCIDX2_MAGIC "MVC2FI03" /* bump the trailing digits to invalidate old two-file caches (02: seek points include open-GOP recovery points; 03: leading orphan dependent AUs are emitted ahead of the first base AU - an older sidecar of an orphan-headed pair caches the mispaired order) */
 
 struct idx_hdr2 {
 	char     magic[8];    /* MVCIDX2_MAGIC, no NUL */
@@ -1104,6 +1104,23 @@ static int nal_is_pic_start(const uint8_t *nal, const uint8_t *end, int type, in
 	return type == 20 && (nal + 4 < end) && (nal[4] & 0x80);
 }
 
+/* anchor_pic_flag of a type-20 slice extension: bit 2 of the third
+ * nal_unit_header_mvc_extension byte (after svc_extension_flag + non_idr_flag +
+ * priority_id + view_id + temporal_id). The extension bytes can contain
+ * emulation-prevention 0x03 bytes (a zero priority_id and a small view_id yield
+ * a 00 00 pair before the third byte), so de-escape while reading. Returns 0/1,
+ * or -1 on a truncated NAL. */
+static int nal20_anchor_flag(const uint8_t *nal, const uint8_t *end) {
+	int zeros = 0, got = 0;
+	for (const uint8_t *p = nal + 1; p < end; p++) {
+		if (zeros >= 2 && *p == 3) { zeros = 0; continue; } /* emulation prevention */
+		zeros = (*p == 0) ? zeros + 1 : 0;
+		if (++got == 3)
+			return (*p >> 2) & 1;
+	}
+	return -1;
+}
+
 /* One NAL of a single view stream, tagged with the access unit it belongs to. */
 typedef struct { const uint8_t *start, *end; int type, au; } ViewNal;
 
@@ -1203,12 +1220,61 @@ static int build_interleaved_pass(MvcSource *s, int use_poc, char *err, size_t e
 	s->spans = malloc((size_t)(nb + nd) * sizeof *s->spans);
 	if (!s->spans) { set_err(err, errsize, "out of memory"); free(bn); free(dn); free(pc); return -1; }
 
-	int n_au = nab > nad ? nab : nad;
+	/* A pair cut mid-stream can begin with ORPHAN dependent access units whose
+	 * base pictures lie before the cut (the trailing dependent section of the
+	 * previous AU - seen on a real chapter cut). Pairing the two AU sequences by
+	 * index would then hand every base picture the previous AU's dependent view,
+	 * corrupting inter-view prediction for the whole clip. Detect the orphans:
+	 * when the base stream starts at an IDR, its dependent counterpart must be an
+	 * anchor picture (an anchor access unit's view components are all anchors,
+	 * H.264 H.8; Blu-ray authors dependent anchors at every base random-access
+	 * point), so leading dependent AUs whose first slice extension is NOT an
+	 * anchor cannot belong to it. Emit them ahead of the first base AU - the
+	 * position they held in the combined stream, where the decoder identifies and
+	 * drops a base-less dependent - and pair dependent AU i+shift with base AU i.
+	 * Bounded to a few AUs so a detection misfire on an exotic stream cannot
+	 * shift away a whole clip; zero on every well-formed aligned pair (their
+	 * first dependent AU is the anchor itself). */
+	int dep_shift = 0;
+	{
+		int base_is_idr = 0;
+		for (int i = 0; i < nb; i++) {
+			if (nal_is_pic_start(bn[i].start, bn[i].end, bn[i].type, 1)) {
+				base_is_idr = bn[i].type == 5;
+				break;
+			}
+		}
+		if (base_is_idr) {
+			int seen_au = -1;
+			for (int i = 0; i < nd && dn[i].au <= 8; i++) {
+				if (dn[i].type != 20 || dn[i].au == seen_au)
+					continue;
+				seen_au = dn[i].au; /* first slice extension of this dependent AU */
+				int a = nal20_anchor_flag(dn[i].start, dn[i].end);
+				if (a == 1) { dep_shift = dn[i].au; break; }
+				if (a < 0) break; /* unreadable: keep index pairing */
+			}
+		}
+	}
+
+	int n_au = nab > nad - dep_shift ? nab : nad - dep_shift;
 	int bi = 0, di = 0, si = 0;
 	int frames = 0, is_mvc = 0, seen_sps = 0, seen_pps = 0;
 	int recovery_seen = 0;              /* a recovery_point SEI is pending for the next picture */
 	int cvs_base = 0, cvs_first_sp = 0; /* start of the coded video sequence being scanned */
 	int rc = 0;
+	/* leading orphan dependent AUs, ahead of the first base AU (see above) */
+	for (; di < nd && dn[di].au < dep_shift; di++, si++) {
+		int type = dn[di].type;
+		s->spans[si].start = dn[di].start;
+		s->spans[si].end = dn[di].end;
+		if (type == 7 || type == 8 || type == 13 || type == 15) {
+			int before = s->nps;
+			ps_push(s, dn[di].start, dn[di].end, type, h264_param_set_id(dn[di].start, dn[di].end, type));
+			if (s->nps > before) s->ps[s->nps - 1].nal_i = si; /* guard: ps_push no-ops on OOM */
+		}
+		if (type == 20 || type == 15) is_mvc = 1;
+	}
 	for (int au = 0; au < n_au; au++) {
 		int au_start_si = si;
 		for (; bi < nb && bn[bi].au == au; bi++, si++) {
@@ -1261,7 +1327,7 @@ static int build_interleaved_pass(MvcSource *s, int use_poc, char *err, size_t e
 				recovery_seen = 0; /* consumed by this picture */
 			}
 		}
-		for (; di < nd && dn[di].au == au; di++, si++) {
+		for (; di < nd && dn[di].au == au + dep_shift; di++, si++) {
 			int type = dn[di].type;
 			s->spans[si].start = dn[di].start;
 			s->spans[si].end = dn[di].end;
