@@ -138,10 +138,44 @@ struct MvcSource {
 	int ring_cap;        /* number of slots (0 until ring_init) */
 	int ring_head;       /* round-robin insert position */
 	Edge264Frame cur;
+
+	/* Indexing-scan progress reporting (see MvcProgressFn). Only set for the
+	 * duration of mvc_open2 - progress_ctx may point at the caller's stack, so it
+	 * is cleared before open returns and never invoked afterwards. */
+	MvcProgressFn progress;
+	void *progress_ctx;
+	int64_t prog_total;  /* bytes the current scan pass covers */
+	int64_t prog_step;   /* report granularity (~1% of prog_total) */
+	int64_t prog_next;   /* next `done` value worth a report */
 };
 
 static void set_err(char *err, size_t n, const char *msg) {
 	if (err && n) { snprintf(err, n, "%s", msg); }
+}
+
+/* --- indexing-scan progress ------------------------------------------------ */
+
+/* A scan pass covering `total` bytes begins; the first tick reports 0% so the
+ * host shows life immediately. Reports are throttled to ~1% steps here (the
+ * scan loops run per NAL, far too often to call out on each). */
+static void progress_begin(MvcSource *s, int64_t total) {
+	if (!s->progress) return;
+	s->prog_total = total;
+	s->prog_step = total > 100 ? total / 100 : 1;
+	s->prog_next = 0;
+}
+
+static void progress_tick(MvcSource *s, int64_t done) {
+	if (!s->progress || done < s->prog_next) return;
+	s->progress(s->progress_ctx, done, s->prog_total);
+	s->prog_next = done + s->prog_step;
+}
+
+/* The scan pass completed: report done == total unconditionally, so the host
+ * always sees a final 100% regardless of where the last throttled tick fell. */
+static void progress_end(MvcSource *s) {
+	if (!s->progress) return;
+	s->progress(s->progress_ctx, s->prog_total, s->prog_total);
 }
 
 /* --- read-only file mapping (platform shim) ------------------------------- */
@@ -656,7 +690,12 @@ static int scan_index_pass(MvcSource *s, int use_poc) {
 			return -1;
 		h264_poc_ctx_init(pc);
 	}
+	/* Progress in whole-file byte positions (total == file size), matching the
+	 * two-file scan's metric; the few leading start-code bytes before s->start
+	 * merely make the first tick report 0% instead of starting past it. */
+	progress_begin(s, (int64_t)s->map_size);
 	while (p < end) {
+		progress_tick(s, (int64_t)(p - s->map));
 		int type = p[0] & 0x1f;
 		int is_vcl = (type >= 1 && type <= 5) || type == 19 || type == 20;
 		const uint8_t *sc = edge264_find_start_code(p, end, 0);
@@ -725,6 +764,7 @@ out:
 	if (rc == 0) {
 		s->num_pics = frames;
 		s->info.is_mvc = is_mvc;
+		progress_end(s);
 	}
 	return rc;
 }
@@ -1134,9 +1174,13 @@ typedef struct { const uint8_t *start, *end; int type, au; } ViewNal;
  *
  * Returns a malloc'd array (caller frees) via *out with *n NALs across *n_au
  * access units, or -1 on OOM, a missing start code, or an empty stream.
+ *
+ * prog_off is this file's byte offset within the whole scan's progress range
+ * (0 for the base file, the base file's size for the dependent one), so the two
+ * consecutive walks report one continuous 0..100% ramp.
  */
-static int collect_view_nals(const uint8_t *map, size_t map_size, int is_base,
-	ViewNal **out, int *n, int *n_au) {
+static int collect_view_nals(MvcSource *s, const uint8_t *map, size_t map_size, int is_base,
+	int64_t prog_off, ViewNal **out, int *n, int *n_au) {
 	*out = NULL; *n = 0; *n_au = 0;
 	if (map_size < 4) return -1;
 	if (!(map[0] == 0 && map[1] == 0 && (map[2] == 1 || (map[2] == 0 && map[3] == 1))))
@@ -1146,6 +1190,7 @@ static int collect_view_nals(const uint8_t *map, size_t map_size, int is_base,
 	ViewNal *arr = NULL;
 	int cnt = 0, cap = 0, cur_au = 0, seen_vcl = 0;
 	while (p < end) {
+		progress_tick(s, prog_off + (int64_t)(p - map));
 		int type = p[0] & 0x1f;
 		const uint8_t *sc = edge264_find_start_code(p, end, 0);
 		const uint8_t *nend = sc < end ? sc : end;
@@ -1207,12 +1252,16 @@ static int build_interleaved_pass(MvcSource *s, int use_poc, char *err, size_t e
 	}
 	ViewNal *bn = NULL, *dn = NULL;
 	int nb = 0, nd = 0, nab = 0, nad = 0;
-	if (collect_view_nals(s->map, s->map_size, 1, &bn, &nb, &nab) < 0) {
+	/* The two walks below touch every byte of both files (start-code scanning) and
+	 * dominate the build; the interleave loop after them only revisits the already
+	 * collected NAL headers. So bytes-walked over both files is the progress metric. */
+	progress_begin(s, (int64_t)s->map_size + (int64_t)s->map2_size);
+	if (collect_view_nals(s, s->map, s->map_size, 1, 0, &bn, &nb, &nab) < 0) {
 		set_err(err, errsize, "base stream has no decodable NAL units");
 		free(pc);
 		return -1;
 	}
-	if (collect_view_nals(s->map2, s->map2_size, 0, &dn, &nd, &nad) < 0) {
+	if (collect_view_nals(s, s->map2, s->map2_size, 0, (int64_t)s->map_size, &dn, &nd, &nad) < 0) {
 		set_err(err, errsize, "dependent stream has no decodable NAL units");
 		free(bn); free(pc);
 		return -1;
@@ -1352,6 +1401,7 @@ out:
 	if (frames <= 0) { set_err(err, errsize, "no decodable frames found in the base stream"); return -1; }
 	s->num_pics = frames;
 	s->info.is_mvc = is_mvc;
+	progress_end(s);
 	return 0;
 }
 
@@ -1380,7 +1430,8 @@ const MvcInfo *mvc_info(const MvcSource *s) { return &s->info; }
 
 MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
 	MvcLayout layout, int swaplr, int64_t fps_num, int64_t fps_den,
-	int cachesize_mb, char *err, size_t errsize) {
+	int cachesize_mb, MvcProgressFn progress, void *progress_ctx,
+	char *err, size_t errsize) {
 	if (layout < MVC_BASE || layout > MVC_ALT) { /* else assemble_plane's switch fills nothing */
 		set_err(err, errsize, "invalid layout");
 		return NULL;
@@ -1392,6 +1443,8 @@ MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
 	/* clamp the cache budget; <= 0 selects the default (see cache_budget_bytes) */
 	s->cache_budget = cache_budget_bytes(cachesize_mb);
 	s->swaplr = swaplr != 0;
+	s->progress = progress;
+	s->progress_ctx = progress_ctx;
 
 	int64_t src_mtime = 0;
 	s->map = map_file_ro(base_path, &s->map_size, &src_mtime);
@@ -1457,6 +1510,11 @@ MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
 			save_index_cache(s, cpath, s->map_size, src_mtime);
 		free(cpath);
 	}
+	/* The indexing scan - the only progress source - is over. progress_ctx may
+	 * point at the caller's stack (see mvcsource.h), so drop the callback now:
+	 * nothing past this point may ever invoke it. */
+	s->progress = NULL;
+	s->progress_ctx = NULL;
 	s->info.fps_num = fps_num > 0 ? fps_num : 24000;
 	s->info.fps_den = fps_den > 0 ? fps_den : 1001;
 	/* the two-view layouts need a dependent view; on a 2D stream they degrade to
@@ -1508,7 +1566,7 @@ MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
 
 MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swaplr,
 	int64_t fps_num, int64_t fps_den, int cachesize_mb, char *err, size_t errsize) {
-	return mvc_open2(path, NULL, n_threads, layout, swaplr, fps_num, fps_den, cachesize_mb, err, errsize);
+	return mvc_open2(path, NULL, n_threads, layout, swaplr, fps_num, fps_den, cachesize_mb, NULL, NULL, err, errsize);
 }
 
 /* Ensure source picture `src_n` is available in s->cur: from the frame cache if

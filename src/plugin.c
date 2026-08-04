@@ -31,6 +31,29 @@ static int parse_layout(const char *s) {
 	return -1; /* unknown */
 }
 
+/* Indexing-scan progress -> the core's log (mtInformation), which frontends
+ * like vspipe and the VapourSynth Editor surface to the user - the same channel
+ * BestSource's showprogress uses. The core reports ~every 1% of bytes scanned;
+ * log only when the decile (0%, 10%, ..., 100%) changes, so a first open of a
+ * multi-GB stream yields a handful of lines, not a hundred. Lives only for the
+ * duration of the mvc_open2 call (see MvcProgressFn), so stack storage is fine. */
+typedef struct {
+	const VSAPI *vsapi;
+	VSCore *core;
+	int last_decile;
+} ProgressCtx;
+
+static void vs_progress(void *ctx, int64_t done, int64_t total) {
+	ProgressCtx *p = ctx;
+	int pct = total > 0 ? (int)(done * 100 / total) : 100;
+	if (pct / 10 == p->last_decile)
+		return;
+	p->last_decile = pct / 10;
+	char buf[64];
+	snprintf(buf, sizeof buf, "mvc.Source: index progress %d%%", pct);
+	p->vsapi->logMessage(mtInformation, buf, p->core);
+}
+
 static const VSFrame *VS_CC vs_source_get_frame(int n, int activationReason,
 	void *instanceData, void **frameData, VSFrameContext *frameCtx,
 	VSCore *core, const VSAPI *vsapi) {
@@ -122,9 +145,17 @@ static void VS_CC vs_source_create(const VSMap *in, VSMap *out, void *userData,
 		return;
 	}
 	if (!have_num) { fpsnum = 0; fpsden = 0; }
+	/* showprogress: log the indexing scan's progress (default on). The scan only
+	 * runs on a first open - a reopen loads the index sidecar and logs nothing -
+	 * so the default costs a few info lines exactly when a multi-GB stream would
+	 * otherwise sit silent for minutes. */
+	int showprogress = vsapi->mapGetIntSaturated(in, "showprogress", 0, &e);
+	if (e) showprogress = 1;
 
 	char emsg[256];
-	MvcSource *src = mvc_open2(source, dependent, threads, (MvcLayout)layout, swaplr, fpsnum, fpsden, cachesize, emsg, sizeof emsg);
+	ProgressCtx pctx = { vsapi, core, -1 };
+	MvcSource *src = mvc_open2(source, dependent, threads, (MvcLayout)layout, swaplr, fpsnum, fpsden, cachesize,
+		showprogress ? vs_progress : NULL, &pctx, emsg, sizeof emsg);
 	if (!src) {
 		char buf[320];
 		snprintf(buf, sizeof buf, "mvc.Source: %s", emsg);
@@ -169,9 +200,9 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
 		VS_MAKE_VERSION(MVC_VERSION_MAJOR, MVC_VERSION_MINOR), VAPOURSYNTH_API_VERSION, 0, plugin);
 	/* New optional args are appended so existing positional calls keep their
 	 * indices (swaplr after the v0.1.0 set, cachesize after that, dependent after
-	 * that). */
+	 * that, showprogress after that). */
 	vspapi->registerFunction("Source",
-		"source:data;stack:data:opt;threads:int:opt;fpsnum:int:opt;fpsden:int:opt;swaplr:int:opt;cachesize:int:opt;dependent:data:opt;",
+		"source:data;stack:data:opt;threads:int:opt;fpsnum:int:opt;fpsden:int:opt;swaplr:int:opt;cachesize:int:opt;dependent:data:opt;showprogress:int:opt;",
 		"clip:vnode;",
 		vs_source_create, NULL, plugin);
 }

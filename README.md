@@ -140,11 +140,15 @@ clip = core.mvc.Source(r"base.264", dependent=r"dependent.mvc", stack="tab")
 # ... interpolate to 60000/1001 with vs-rife, then output/encode ...
 ```
 
-Signature: `core.mvc.Source(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=0, cachesize=512, dependent="")`.
+Signature: `core.mvc.Source(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=0, cachesize=512, dependent="", showprogress=1)`.
 `threads` is edge264's internal decode parallelism (`-1` auto-detect cores, `0`
 single-thread, or an explicit count); `cachesize` is the decoded-frame cache
 ceiling in MiB (raise it for smoother backward / `Reverse()` seeking on
-long-GOP streams, lower it to save memory).
+long-GOP streams, lower it to save memory). `showprogress` logs the indexing
+scan's progress ("index progress N%") through VapourSynth's log, which vspipe
+and the VapourSynth Editor display; the scan only runs the first time a stream
+is opened (a reopen loads the `.mvcidx` sidecar and logs nothing), so pass
+`showprogress=0` if even that first open should stay silent.
 
 ### AviSynth+
 
@@ -158,8 +162,11 @@ MVCSource("movie.264", stack="tab")
 MVCSource("base.264", dependent="dependent.mvc", stack="tab")
 ```
 
-Signature: `MVCSource(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=false, cachesize=512, dependent="")`.
+Signature: `MVCSource(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=false, cachesize=512, dependent="", showprogress=true)`.
 `threads` and `cachesize` behave as for the VapourSynth signature above.
+`showprogress` prints the first open's indexing progress to stderr (the
+AviSynth+ C interface has no log channel), visible in CLI hosts such as
+avs2yuv, x264 or ffmpeg.
 
 `fpsnum`/`fpsden` must be given together (edge264's public API does not expose
 the VUI rate); the default is 24000/1001.

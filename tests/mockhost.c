@@ -189,6 +189,14 @@ static const VSVideoInfo *VS_CC mock_getVideoInfo(VSNode *node) { return &node->
 static void VS_CC mock_setFilterError(const char *msg, VSFrameContext *ctx) {
 	snprintf(ctx->error, sizeof ctx->error, "%s", msg); ctx->has_error = 1;
 }
+/* The plugin logs its indexing progress (showprogress, default on) through
+ * vsapi->logMessage; without a mock the first fresh open (no sidecar yet, e.g.
+ * in CI) would call through a NULL pointer. Echo the lines so a test run shows
+ * what a real host would. */
+static void VS_CC mock_logMessage(int msgType, const char *msg, VSCore *core) {
+	(void)core;
+	printf("  log[%d]: %s\n", msgType, msg);
+}
 
 static VSAPI g_api;
 static void init_api(void) {
@@ -214,6 +222,7 @@ static void init_api(void) {
 	g_api.createVideoFilter = mock_createVideoFilter;
 	g_api.getVideoInfo = mock_getVideoInfo;
 	g_api.setFilterError = mock_setFilterError;
+	g_api.logMessage = mock_logMessage;
 }
 
 /* ---- VSPLUGINAPI ---- */

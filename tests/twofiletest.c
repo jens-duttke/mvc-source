@@ -44,11 +44,54 @@ static int get(MvcSource *s, int n, uint8_t *Y, uint8_t *U, uint8_t *V, int W, i
 
 static const char *LAYOUT_NAME[] = { "base", "right", "tab", "sbs", "alt" };
 
+/* Progress-callback recorder (see MvcProgressFn): a fresh indexing scan must
+ * report a monotone byte ramp ending at done == total, and a reopen served from
+ * the sidecar must not report at all. */
+typedef struct { int calls; int monotone; int64_t last_done, total; } ProgRec;
+
+static void prog_record(void *ctx, int64_t done, int64_t total) {
+	ProgRec *r = ctx;
+	if (r->calls && done < r->last_done) r->monotone = 0;
+	r->calls++;
+	r->last_done = done;
+	r->total = total;
+}
+
+static int64_t file_size(const char *path) {
+	FILE *f = fopen(path, "rb");
+	if (!f) return -1;
+	fseek(f, 0, SEEK_END);
+	long sz = ftell(f);
+	fclose(f);
+	return sz;
+}
+
+/* Check a recorder against a scan that must have run over `expect_total` bytes.
+ * Returns 0 if it reported a full monotone ramp, -1 (with a message) otherwise. */
+static int check_progress(const ProgRec *r, int64_t expect_total, const char *what) {
+	if (r->calls < 2) {
+		printf("FAIL[progress]: %s: %d callback calls (want at least first + final)\n", what, r->calls);
+		return -1;
+	}
+	if (!r->monotone) { printf("FAIL[progress]: %s: done went backwards\n", what); return -1; }
+	if (r->total != expect_total) {
+		printf("FAIL[progress]: %s: total %lld != scanned bytes %lld\n",
+			what, (long long)r->total, (long long)expect_total);
+		return -1;
+	}
+	if (r->last_done != r->total) {
+		printf("FAIL[progress]: %s: final done %lld != total %lld\n",
+			what, (long long)r->last_done, (long long)r->total);
+		return -1;
+	}
+	return 0;
+}
+
 static int compare_layout(const char *combined, const char *base, const char *dep, MvcLayout lay) {
 	char err[256] = "";
 	MvcSource *sc = mvc_open(combined, 0, lay, 0, 0, 0, 0, err, sizeof err);
 	if (!sc) { fprintf(stderr, "  combined open failed: %s\n", err); return -1; }
-	MvcSource *st = mvc_open2(base, dep, 0, lay, 0, 0, 0, 0, err, sizeof err);
+	MvcSource *st = mvc_open2(base, dep, 0, lay, 0, 0, 0, 0, NULL, NULL, err, sizeof err);
 	if (!st) { fprintf(stderr, "  two-file open failed: %s\n", err); mvc_close(sc); return -1; }
 
 	const MvcInfo *ic = mvc_info(sc), *it = mvc_info(st);
@@ -104,8 +147,14 @@ static int test_cache(const char *base, const char *dep) {
 	remove(cpath);
 	char err[256] = "";
 
-	MvcSource *s = mvc_open2(base, dep, 0, MVC_ALT, 0, 0, 0, 0, err, sizeof err);
+	/* the fresh build must report its scan: a monotone byte ramp over both files */
+	ProgRec pr = { 0, 1, 0, 0 };
+	MvcSource *s = mvc_open2(base, dep, 0, MVC_ALT, 0, 0, 0, 0, prog_record, &pr, err, sizeof err);
 	if (!s) { printf("FAIL[cache]: build open failed: %s\n", err); return -1; }
+	if (check_progress(&pr, file_size(base) + file_size(dep), "fresh two-file build"))
+		{ mvc_close(s); return -1; }
+	printf("ok[progress]: fresh build reported %d monotone ticks up to %lld bytes\n",
+		pr.calls, (long long)pr.total);
 	const MvcInfo *in = mvc_info(s);
 	int W = in->width, H = in->height, CW = W / 2, CH = H / 2, fr = in->num_frames - 1;
 	size_t ysz = (size_t)W * H, csz = (size_t)CW * CH;
@@ -120,10 +169,17 @@ static int test_cache(const char *base, const char *dep) {
 	if (!cf) { printf("FAIL[cache]: no sidecar written\n"); rc = -1; }
 	else { fclose(cf); if (!rc) printf("ok[cache]: sidecar written next to the dependent stream\n"); }
 
-	/* reopen: loads the sidecar, must decode identically */
+	/* reopen: loads the sidecar, must decode identically - and must NOT report
+	 * progress (no scan runs; the whole point of the sidecar) */
 	if (!rc) {
-		MvcSource *s2 = mvc_open2(base, dep, 0, MVC_ALT, 0, 0, 0, 0, err, sizeof err);
+		ProgRec pr2 = { 0, 1, 0, 0 };
+		MvcSource *s2 = mvc_open2(base, dep, 0, MVC_ALT, 0, 0, 0, 0, prog_record, &pr2, err, sizeof err);
 		if (!s2) { printf("FAIL[cache]: reopen failed: %s\n", err); rc = -1; }
+		else if (pr2.calls != 0) {
+			printf("FAIL[progress]: sidecar reopen reported progress (%d calls) - scan not skipped?\n", pr2.calls);
+			rc = -1;
+			mvc_close(s2);
+		}
 		else {
 			if (get(s2, fr, bY, bU, bV, W, CW) ||
 			    memcmp(aY, bY, ysz) || memcmp(aU, bU, csz) || memcmp(aV, bV, csz)) {
@@ -137,7 +193,7 @@ static int test_cache(const char *base, const char *dep) {
 	if (!rc) {
 		FILE *w = fopen(cpath, "wb");
 		if (w) { fwrite("MVC2FI03\xff\xff\xff\xff garbage", 1, 24, w); fclose(w); }
-		MvcSource *s3 = mvc_open2(base, dep, 0, MVC_ALT, 0, 0, 0, 0, err, sizeof err);
+		MvcSource *s3 = mvc_open2(base, dep, 0, MVC_ALT, 0, 0, 0, 0, NULL, NULL, err, sizeof err);
 		if (!s3) { printf("FAIL[cache]: open over a corrupt sidecar failed: %s\n", err); rc = -1; }
 		else {
 			if (get(s3, fr, bY, bU, bV, W, CW) ||
@@ -177,7 +233,7 @@ static int test_cold_seeks(const char *combined, const char *base, const char *d
 		int t = targets[k];
 		if (t < 0 || t >= N) continue;
 		if (get(sc, t, cY, cU, cV, W, CW)) { rc = -1; break; }
-		MvcSource *st = mvc_open2(base, dep, 0, MVC_TAB, 0, 0, 0, 0, err, sizeof err);
+		MvcSource *st = mvc_open2(base, dep, 0, MVC_TAB, 0, 0, 0, 0, NULL, NULL, err, sizeof err);
 		if (!st) { printf("FAIL[cold]: two-file open failed: %s\n", err); rc = -1; break; }
 		if (get(st, t, tY, tU, tV, W, CW)) rc = -1;
 		else if (memcmp(cY, tY, ysz) || memcmp(cU, tU, csz) || memcmp(cV, tV, csz)) {
@@ -245,7 +301,7 @@ static int test_orphan_head(const char *combined, const char *base, const char *
 
 	char err[256] = "";
 	MvcSource *sc = mvc_open(combined, 0, MVC_TAB, 0, 0, 0, 0, err, sizeof err);
-	MvcSource *st = sc ? mvc_open2(base, tmp, 0, MVC_TAB, 0, 0, 0, 0, err, sizeof err) : NULL;
+	MvcSource *st = sc ? mvc_open2(base, tmp, 0, MVC_TAB, 0, 0, 0, 0, NULL, NULL, err, sizeof err) : NULL;
 	if (!sc || !st) { printf("FAIL[orphan]: open failed: %s\n", err); rc = -1; }
 	if (!rc) {
 		const MvcInfo *ic = mvc_info(sc), *it = mvc_info(st);
@@ -276,6 +332,32 @@ static int test_orphan_head(const char *combined, const char *base, const char *
 	remove(tmp);
 	remove(cpath);
 	return rc;
+}
+
+/* The single-file scan (scan_index_pass) must report the same monotone ramp as
+ * the two-file build: remove the combined stream's sidecar so a real scan runs,
+ * then reopen and require silence (sidecar hit, no scan). */
+static int test_progress_singlefile(const char *combined) {
+	char cpath[2048];
+	snprintf(cpath, sizeof cpath, "%s.mvcidx", combined);
+	remove(cpath);
+	char err[256] = "";
+	ProgRec pr = { 0, 1, 0, 0 };
+	MvcSource *s = mvc_open2(combined, NULL, 0, MVC_BASE, 0, 0, 0, 0, prog_record, &pr, err, sizeof err);
+	if (!s) { printf("FAIL[progress]: single-file open failed: %s\n", err); return -1; }
+	mvc_close(s);
+	if (check_progress(&pr, file_size(combined), "fresh single-file scan"))
+		return -1;
+	ProgRec pr2 = { 0, 1, 0, 0 };
+	s = mvc_open2(combined, NULL, 0, MVC_BASE, 0, 0, 0, 0, prog_record, &pr2, err, sizeof err);
+	if (!s) { printf("FAIL[progress]: single-file reopen failed: %s\n", err); return -1; }
+	mvc_close(s);
+	if (pr2.calls != 0) {
+		printf("FAIL[progress]: single-file sidecar reopen reported progress (%d calls)\n", pr2.calls);
+		return -1;
+	}
+	printf("ok[progress]: single-file scan reported %d monotone ticks; sidecar reopen silent\n", pr.calls);
+	return 0;
 }
 
 int main(int argc, char **argv) {
@@ -315,6 +397,7 @@ int main(int argc, char **argv) {
 	rc |= test_cold_seeks(combined, base, dep);
 	rc |= test_orphan_head(combined, base, dep);
 	rc |= test_cache(base, dep);
+	rc |= test_progress_singlefile(combined);
 
 	printf(rc ? "RESULT: FAIL\n" : "RESULT: PASS (mvc_open2 bit-exact to the combined decode on a real demux)\n");
 	return rc ? 1 : 0;

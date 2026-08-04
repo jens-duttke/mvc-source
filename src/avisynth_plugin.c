@@ -32,6 +32,21 @@ static int parse_layout(const char *s) {
 	return -1; /* unknown */
 }
 
+/* Indexing-scan progress -> stderr (the AviSynth+ C interface exposes no log
+ * channel), visible in CLI hosts (avs2yuv, x264 --demuxer avs, ffmpeg) and
+ * harmlessly discarded in console-less GUI hosts. The core reports ~every 1% of
+ * bytes scanned; print only when the decile (0%, 10%, ..., 100%) changes. Lives
+ * only for the duration of the mvc_open2 call (see MvcProgressFn), so the ctx
+ * is a stack int holding the last printed decile. */
+static void avs_progress(void *ctx, int64_t done, int64_t total) {
+	int *last_decile = ctx;
+	int pct = total > 0 ? (int)(done * 100 / total) : 100;
+	if (pct / 10 == *last_decile)
+		return;
+	*last_decile = pct / 10;
+	fprintf(stderr, "MVCSource: index progress %d%%\n", pct);
+}
+
 /* --- filter callbacks (plain C function pointers: ABI-stable) -------------- */
 
 /* MT_SERIALIZED (=3 in the C++ MtMode enum) has no named constant in the C API.
@@ -93,7 +108,7 @@ static void AVSC_CC mvc_cb_free_filter(AVS_FilterInfo *fi) {
 	mvc_close((MvcSource *)fi->user_data);
 }
 
-/* MVCSource(source[, stack, threads, fpsnum, fpsden, swaplr, cachesize, dependent]) */
+/* MVCSource(source[, stack, threads, fpsnum, fpsden, swaplr, cachesize, dependent, showprogress]) */
 
 static AVS_Value AVSC_CC Create_MVCSource(AVS_ScriptEnvironment *env, AVS_Value args, void *user_data) {
 	(void)user_data;
@@ -138,9 +153,16 @@ static AVS_Value AVSC_CC Create_MVCSource(AVS_ScriptEnvironment *env, AVS_Value 
 	 * stream. The two are interleaved in memory - no on-disk remux. */
 	AVS_Value a_dependent = avs_array_elt(args, 7);
 	const char *dependent = avs_defined(a_dependent) ? avs_as_string(a_dependent) : NULL;
+	/* showprogress: print the indexing scan's progress to stderr (default on).
+	 * The scan only runs on a first open - a reopen loads the index sidecar and
+	 * prints nothing. */
+	AVS_Value a_showprogress = avs_array_elt(args, 8);
+	int showprogress = avs_defined(a_showprogress) ? (avs_as_bool(a_showprogress) ? 1 : 0) : 1;
 
 	char emsg[256];
-	MvcSource *src = mvc_open2(source, dependent, threads, (MvcLayout)layout, swaplr, fpsnum, fpsden, cachesize, emsg, sizeof emsg);
+	int prog_decile = -1;
+	MvcSource *src = mvc_open2(source, dependent, threads, (MvcLayout)layout, swaplr, fpsnum, fpsden, cachesize,
+		showprogress ? avs_progress : NULL, &prog_decile, emsg, sizeof emsg);
 	if (!src) {
 		char buf[320];
 		snprintf(buf, sizeof buf, "MVCSource: %s", emsg);
@@ -186,7 +208,7 @@ static AVS_Value AVSC_CC Create_MVCSource(AVS_ScriptEnvironment *env, AVS_Value 
 
 MVC_PLUGIN_EXPORT const char *AVSC_CC avisynth_c_plugin_init(AVS_ScriptEnvironment *env) {
 	avs_add_function(env, "MVCSource",
-		"[source]s[stack]s[threads]i[fpsnum]i[fpsden]i[swaplr]b[cachesize]i[dependent]s",
+		"[source]s[stack]s[threads]i[fpsnum]i[fpsden]i[swaplr]b[cachesize]i[dependent]s[showprogress]b",
 		Create_MVCSource, 0);
 	return "MVCSource: H.264 MVC (3D) and AVC source, built on edge264-mvc";
 }

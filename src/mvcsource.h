@@ -18,6 +18,17 @@
 
 typedef struct MvcSource MvcSource;
 
+/*
+ * Progress callback for the indexing scan an open may run. Reports bytes
+ * consumed of the total to scan (done == total on completion), so a host can
+ * surface "index progress N%" while a first open walks a multi-GB stream. Only
+ * invoked during mvc_open2, synchronously from the calling thread, and only
+ * when a fresh scan actually runs - a reopen served from the on-disk index
+ * sidecar issues no callbacks. If the scan restarts (the recovery-point
+ * derivation falls back to IDR-only seek points), done restarts from 0.
+ */
+typedef void (*MvcProgressFn)(void *ctx, int64_t done, int64_t total);
+
 typedef enum {
 	MVC_BASE  = 0, /* base / left view only (2D)          */
 	MVC_RIGHT = 1, /* dependent / right view only         */
@@ -76,10 +87,15 @@ MvcSource *mvc_open(const char *path, int n_threads, MvcLayout layout, int swapl
  * IDR-only seek points (slower on a long GOP, never wrong). The interleave +
  * seek index is cached in a sidecar next to the dependent stream
  * (`<dep>.mvcidx`), so a reopen skips the full scan of both files.
+ *
+ * progress (optional, may be NULL) reports the indexing scan's progress - see
+ * MvcProgressFn. It is used only for the duration of this call; progress_ctx
+ * may therefore point at stack storage of the caller.
  */
 MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
 	MvcLayout layout, int swaplr, int64_t fps_num, int64_t fps_den,
-	int cachesize_mb, char *err, size_t errsize);
+	int cachesize_mb, MvcProgressFn progress, void *progress_ctx,
+	char *err, size_t errsize);
 
 const MvcInfo *mvc_info(const MvcSource *s);
 
