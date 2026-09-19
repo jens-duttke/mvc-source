@@ -1,0 +1,14 @@
+# Vendored SDK headers (VapourSynth API4, AviSynth+ C interface). They are
+# third-party code, are never edited by hand, and only ever change wholesale
+# when a newer SDK is vendored in - a ~2800-line diff that carries no
+# reviewable information and would drown the real changes. Suppress it by
+# default; `git diff --text include/` still shows the full diff on demand.
+# linguist-vendored additionally keeps them out of GitHub's language stats and
+# collapses them in the web diff.
+/include/** -diff linguist-vendored
+
+# Binary test fixtures (Annex-B elementary streams). Git already auto-detects
+# these as binary, but say so explicitly so no future fixture can be mangled by
+# an EOL conversion or produce a garbage textual diff.
+*.264 binary
+*.mvc  binary
