@@ -6,7 +6,6 @@
 #include "cache_budget.h"
 #include "h264poc.h"
 
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +19,7 @@
   #include <unistd.h>
 #endif
 
-#include "edge264.h"
+#include "edge264mvc.h"
 
 /*
  * A random-access point to seek to: an IDR, or an open-GOP recovery point (a
@@ -53,7 +52,7 @@ typedef struct { const uint8_t *nal; int frame, valid_from; int nal_i; } SeekPoi
  * contiguous stream, which repositions on the `nal` pointer instead. */
 
 /* One NAL unit of the logical (combined) stream: [start,end) is its bytes from
- * the NAL header up to the next start code, exactly the range edge264_decode_NAL
+ * the NAL header up to the next start code, exactly the range edge264mvc_send_nal
  * takes. In two-file mode the spans point alternately into the base-view and
  * dependent-view mappings, in access-unit-interleaved decode order, so feeding
  * them in sequence reconstructs the combined MVC stream without copying either
@@ -72,16 +71,42 @@ typedef struct { const uint8_t *nal, *end; int type, id; int nal_i; } ParamNal;
  * so a two-file seek can re-feed only the sets preceding its target. -1 for a
  * single contiguous stream, where the `nal` pointer's ordering serves instead. */
 
+/* The fields of a decoded picture this core reads: the planes of the base view
+ * (samples) and, for MVC, of the dependent view (samples_mvc, NULL otherwise),
+ * the luma and chroma sizes and strides, and the display-order key. It is filled
+ * from an Edge264MvcFrame (picture_from) or points into a cache slot's copy. */
+typedef struct {
+	const uint8_t *samples[3];
+	const uint8_t *samples_mvc[3];
+	int width_Y, width_C, height_Y, height_C;
+	int stride_Y, stride_C;
+	int64_t DisplayPoc;
+} Picture;
+
+static void picture_from(Picture *p, const Edge264MvcFrame *f) {
+	for (int i = 0; i < 3; i++) {
+		p->samples[i] = f->views[0].planes[i];
+		p->samples_mvc[i] = f->views[1].planes[i];
+	}
+	p->width_Y = f->width_Y;
+	p->width_C = f->width_C;
+	p->height_Y = f->height_Y;
+	p->height_C = f->height_C;
+	p->stride_Y = f->stride_Y;
+	p->stride_C = f->stride_C;
+	p->DisplayPoc = f->views[0].display_order;
+}
+
 /* A cached decoded source picture: an independent copy of the base (and, for
- * MVC, the dependent) view's packed planes, plus an Edge264Frame view over that
- * copy. Because the copy is independent of the decoder, it survives edge264_free
- * (a seek) and lets backward / repeat access - the pathological case for a
+ * MVC, the dependent) view's packed planes, plus a Picture view over that
+ * copy. Because the copy is independent of the decoder, it survives
+ * edge264mvc_close (a seek) and lets backward / repeat access - the pathological case for a
  * source filter, e.g. AviSynth Reverse() - hit RAM instead of re-decoding a GOP. */
 typedef struct {
 	int index;           /* source picture index held, or -1 if empty */
 	uint8_t *buf;        /* packed base [+ dependent] Y/U/V planes */
 	size_t bufcap;
-	Edge264Frame frame;  /* view over buf: samples/samples_mvc + packed strides */
+	Picture frame;       /* view over buf: samples/samples_mvc + packed strides */
 } FrameSlot;
 
 /* Decoded-frame cache: a ring of the most recently produced pictures, so a
@@ -119,7 +144,9 @@ struct MvcSource {
 	ParamNal *ps;          /* parameter-set NALs in stream order */
 	int nps, pscap;
 
-	Edge264Decoder *dec;
+	Edge264MvcDecoder *dec;
+	Edge264MvcFrame held;  /* the frame last received from dec, until release_held */
+	int holding;           /* whether `held` is still to be released */
 	const uint8_t *nal;    /* current feed position (single-file mode) */
 	int feed_si;           /* current feed position as a span index (two-file mode) */
 	int next_out;          /* display index of the next frame get_frame will yield */
@@ -137,7 +164,7 @@ struct MvcSource {
 	FrameSlot *slots;
 	int ring_cap;        /* number of slots (0 until ring_init) */
 	int ring_head;       /* round-robin insert position */
-	Edge264Frame cur;
+	Picture cur;
 
 	/* Indexing-scan progress reporting (see MvcProgressFn). Only set for the
 	 * duration of mvc_open2 - progress_ctx may point at the caller's stack, so it
@@ -659,7 +686,7 @@ static int flush_cvs(MvcSource *s, const PocBuf *pb, int base, int first_sp) {
  *
  * A base picture is only counted once a base-view SPS (type 7) and a PPS (type 8)
  * have appeared earlier in the stream. This mirrors the decoder, which returns
- * EBADMSG (and produces no frame) for a slice whose SPS/PPS is not yet
+ * EDGE264MVC_CORRUPT (and produces no frame) for a slice whose SPS/PPS is not yet
  * initialized: a stream cut mid-GOP begins with VCL slices that reference the
  * (now discarded) parameter sets of the previous GOP, and counting those would
  * overcount num_frames - shifting every later display index and running past the
@@ -698,7 +725,7 @@ static int scan_index_pass(MvcSource *s, int use_poc) {
 		progress_tick(s, (int64_t)(p - s->map));
 		int type = p[0] & 0x1f;
 		int is_vcl = (type >= 1 && type <= 5) || type == 19 || type == 20;
-		const uint8_t *sc = edge264_find_start_code(p, end, 0);
+		const uint8_t *sc = p + edge264mvc_find_start_code(p, (size_t)(end - p));
 		const uint8_t *nend = sc < end ? sc : end;
 		if (!is_vcl && in_vcl) { au_start = p; in_vcl = 0; } /* leading NAL of the next AU */
 		if (type == 20 || type == 15)
@@ -792,9 +819,10 @@ static void scan_index(MvcSource *s) {
 /*
  * Advance decoding until one frame is output. Returns 1 with *out filled, 0 at a
  * clean end of stream, or -1 on a hard decode error (message written to err).
- * Mirrors a robust player loop: skip ENOTSUP (unspecified NALs such as the
- * type-24 units on 3D Blu-rays), tolerate EBADMSG, and carry a progress guard so
- * an end-of-stream ENOBUFS cannot spin forever. ENOMEM/EINVAL are NOT skippable:
+ * Mirrors a robust player loop: skip EDGE264MVC_UNSUPPORTED (unspecified NALs
+ * such as the type-24 units on 3D Blu-rays), tolerate EDGE264MVC_CORRUPT, and
+ * carry a progress guard so EDGE264MVC_AGAIN cannot spin forever.
+ * EDGE264MVC_NOMEM/INVALID are NOT skippable:
  * the NAL produced no frame, so swallowing it would drop a picture and shift
  * every later display index - fail loudly instead.
  */
@@ -809,7 +837,7 @@ static void scan_index(MvcSource *s) {
  * successive output pictures sharing a raw POC - must not abort an otherwise
  * correct decode. Returns 1 on success, 0 on a divergence (err set); last_poc is
  * INT64_MIN after a reset. */
-static int check_display_order(MvcSource *s, const Edge264Frame *out, char *err, size_t errsize) {
+static int check_display_order(MvcSource *s, const Picture *out, char *err, size_t errsize) {
 	if (s->last_poc != INT64_MIN && out->DisplayPoc < s->last_poc) {
 		set_err(err, errsize, "decoder output order diverged (display POC decreased)");
 		return 0;
@@ -836,7 +864,7 @@ static void feed_peek(MvcSource *s, const uint8_t **buf, const uint8_t **e, int 
 	} else {
 		*at_end = s->nal >= s->end;
 		*buf = *at_end ? s->end : s->nal;
-		*e = *at_end ? s->end : edge264_find_start_code(s->nal, s->end, 0);
+		*e = *at_end ? s->end : s->nal + edge264mvc_find_start_code(s->nal, (size_t)(s->end - s->nal));
 	}
 }
 
@@ -848,31 +876,55 @@ static void feed_advance(MvcSource *s, const uint8_t *e) {
 		s->nal = (e < s->end) ? e + 3 : s->end; /* avoid forming s->end + 3 (UB) */
 }
 
-static int decode_next_output(MvcSource *s, Edge264Frame *out, char *err, size_t errsize) {
-	if (edge264_get_frame(s->dec, out, 0) == 0)
+/* Open a decoder with the core's thread setting (-1 auto-detect, 0 decode on the
+ * calling thread, >0 that many worker threads; see mvc_open). */
+static Edge264MvcDecoder *open_decoder(int n_threads) {
+	Edge264MvcSettings settings;
+	edge264mvc_default_settings(&settings);
+	settings.n_threads = n_threads < 0 ? 0 : n_threads == 0 ? 1 : n_threads;
+	Edge264MvcDecoder *dec = NULL;
+	return edge264mvc_open(&dec, &settings) == EDGE264MVC_OK ? dec : NULL;
+}
+
+/* The frame last received stays with the core - out and s->cur may point into its
+ * planes - until the next decode step, a seek or the close hands it back. */
+static void release_held(MvcSource *s) {
+	if (s->holding) {
+		edge264mvc_release_frame(s->dec, &s->held);
+		s->holding = 0;
+	}
+}
+
+static int receive_picture(MvcSource *s, Picture *out) {
+	if (edge264mvc_receive_frame(s->dec, &s->held) != EDGE264MVC_OK)
+		return 0;
+	s->holding = 1;
+	picture_from(out, &s->held);
+	return 1;
+}
+
+static int decode_next_output(MvcSource *s, Picture *out, char *err, size_t errsize) {
+	release_held(s);
+	if (receive_picture(s, out))
 		return check_display_order(s, out, err, errsize) ? 1 : -1;
 	int stuck = 0;
 	for (;;) {
 		int at_end;
 		const uint8_t *buf, *e;
 		feed_peek(s, &buf, &e, &at_end);
-		int r = edge264_decode_NAL(s->dec, buf, e, NULL, NULL);
-		if (edge264_get_frame(s->dec, out, 0) == 0) {
-			if (r != ENOBUFS && !at_end)
+		int r = at_end ? edge264mvc_send_end(s->dec) : edge264mvc_send_nal(s->dec, buf, (size_t)(e - buf), 0, 0);
+		if (receive_picture(s, out)) {
+			if (r != EDGE264MVC_AGAIN && !at_end)
 				feed_advance(s, e);
 			return check_display_order(s, out, err, errsize) ? 1 : -1;
 		}
-		if (r == ENOBUFS) {
-			/* The output queue is full and get_frame drains nothing - on a
-			 * well-formed stream every ENOBUFS releases at least one frame, so
-			 * this only accumulates on degenerate/crafted input whose pictures
-			 * never complete. edge264 checks its per-view fullness gate before the
-			 * buf>=end drain branch, so the flush sentinel (s->end,s->end) also
-			 * returns ENOBUFS and cannot arm the drain via the public API (its own
-			 * harness reaches into the private `flushing` flag, which edge264.h
-			 * does not expose). Forcing the sentinel here would spin forever at
-			 * 100% CPU, so fail loudly instead - a source filter must not hang on
-			 * untrusted media. Matches the ENOMEM/EINVAL data-loss handling below. */
+		if (r == EDGE264MVC_AGAIN) {
+			/* The decoder is full and no frame came out. Every round of AGAIN
+			 * makes progress on a stream the decoder handles (a frame, or a
+			 * dropped picture that cannot be output), so a run of them only comes
+			 * from a decoder fault on degenerate input; fail loudly rather than
+			 * spin - a source filter must not hang on untrusted media. Matches the
+			 * NOMEM/INVALID data-loss handling below. */
 			if (++stuck > 64) {
 				set_err(err, errsize, "decoder stalled: output queue full but no frame available (corrupt stream?)");
 				return -1;
@@ -880,28 +932,29 @@ static int decode_next_output(MvcSource *s, Edge264Frame *out, char *err, size_t
 			continue;
 		}
 		stuck = 0;
-		if (r == ENOMEM || r == EINVAL) { /* picture not produced: data loss, not a skip */
-			set_err(err, errsize, r == ENOMEM ? "out of memory while decoding" : "decoder rejected input");
+		if (r == EDGE264MVC_NOMEM || r == EDGE264MVC_INVALID) { /* picture not produced: data loss, not a skip */
+			set_err(err, errsize, r == EDGE264MVC_NOMEM ? "out of memory while decoding" : "decoder rejected input");
 			return -1;
 		}
 		if (at_end)
-			return 0; /* ENODATA: fully drained */
+			return 0; /* END: every frame was received */
 		/* mirror scan_index's guard: e can be s->end (last NAL), and forming
 		 * s->end + 3 is UB (C11 6.5.6p8) even though it is only ever compared */
-		feed_advance(s, e); /* success / ENOTSUP skip / EBADMSG tolerate */
+		feed_advance(s, e); /* OK / UNSUPPORTED skipped / CORRUPT tolerated */
 	}
 }
 
 /* Reposition the decoder so the next output frame has display index >= target,
  * choosing the nearest usable seek point. The decoder is torn down and
- * recreated for a clean state: edge264_flush is documented for seeking but its
- * output queue is left in an end-of-stream state after a full drain (no shipped
- * harness exercises seek-then-decode), which would make get_frame keep
- * returning the last frame. free+alloc is unconditionally correct; seeks are
- * rare in the near-sequential access a source filter sees. */
+ * recreated rather than flushed (edge264mvc_flush): a fresh decoder carries no
+ * state from the abandoned position - not even its parameter sets, which
+ * refeed_param_sets re-sends - so the decode from the seek point matches a
+ * sequential one by construction, and seeks are rare in the near-sequential
+ * access a source filter sees. */
 static int reset_decoder(MvcSource *s) {
-	edge264_free(&s->dec);
-	s->dec = edge264_alloc(s->n_threads, NULL, NULL, 0, NULL, NULL, NULL);
+	release_held(s);
+	edge264mvc_close(&s->dec);
+	s->dec = open_decoder(s->n_threads);
 	s->last_poc = INT64_MIN; /* display order restarts from the seek point */
 	/* the frame cache holds independent copies, so it survives the reset */
 	return s->dec != NULL;
@@ -961,7 +1014,7 @@ static void refeed_param_sets(MvcSource *s, const uint8_t *sp_nal, int sp_i) {
 	for (int i = 0; i < n; i++) {
 		int k = ps_kind(s->ps[i].type), id = s->ps[i].id;
 		if (k < 0 || id < 0 || id >= 256 || last[k][id] == i)
-			edge264_decode_NAL(s->dec, s->ps[i].nal, s->ps[i].end, NULL, NULL);
+			edge264mvc_send_nal(s->dec, s->ps[i].nal, (size_t)(s->ps[i].end - s->ps[i].nal), 0, 0);
 	}
 }
 
@@ -1016,7 +1069,7 @@ static void copy_plane(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
 
 /* Bytes to cache one source picture: base Y/U/V plus, for MVC, the dependent
  * view's Y/U/V, all stored packed (stride == width). */
-static size_t slot_bytes(const Edge264Frame *f) {
+static size_t slot_bytes(const Picture *f) {
 	size_t one = (size_t)f->width_Y * f->height_Y + 2 * (size_t)f->width_C * f->height_C;
 	return f->samples_mvc[0] ? 2 * one : one;
 }
@@ -1025,7 +1078,7 @@ static size_t slot_bytes(const Edge264Frame *f) {
  * clamped to [2, MAX_SLOTS]. Buffers are allocated lazily by ring_store, so a
  * large budget costs memory only for frames actually cached. Returns 0, or -1 on
  * allocation failure. */
-static int ring_init(MvcSource *s, const Edge264Frame *f) {
+static int ring_init(MvcSource *s, const Picture *f) {
 	size_t per = slot_bytes(f);
 	size_t budget = s->cache_budget ? s->cache_budget : ((size_t)DEFAULT_FRAME_CACHE_MB << 20);
 	int cap = per ? (int)(budget / per) : FRAME_CACHE_MAX_SLOTS;
@@ -1048,7 +1101,7 @@ static FrameSlot *ring_find(MvcSource *s, int index) {
 /* Copy borrowed decoder frame `f` into the next ring slot (round-robin) and
  * build a view over the copy. Returns the slot, or NULL on OOM (the caller then
  * falls back to the borrowed frame, which is valid until the next decode). */
-static FrameSlot *ring_store(MvcSource *s, int index, const Edge264Frame *f) {
+static FrameSlot *ring_store(MvcSource *s, int index, const Picture *f) {
 	if (s->ring_cap == 0) return NULL;
 	FrameSlot *sl = &s->slots[s->ring_head];
 	s->ring_head = (s->ring_head + 1) % s->ring_cap;
@@ -1097,7 +1150,7 @@ static void ring_free(MvcSource *s) {
 /* Write one plane (index 0=Y,1=U,2=V) of frame `f` into dst per `layout`. The
  * layout is passed in rather than read from s->info because MVC_ALT resolves,
  * per output frame, to a single-view MVC_BASE or MVC_RIGHT (see mvc_get_frame). */
-static void assemble_plane(const MvcSource *s, const Edge264Frame *f, int plane,
+static void assemble_plane(const MvcSource *s, const Picture *f, int plane,
 	MvcLayout layout, uint8_t *dst, ptrdiff_t dstride) {
 	int chroma = plane > 0;
 	int w = chroma ? f->width_C : f->width_Y;
@@ -1192,7 +1245,7 @@ static int collect_view_nals(MvcSource *s, const uint8_t *map, size_t map_size, 
 	while (p < end) {
 		progress_tick(s, prog_off + (int64_t)(p - map));
 		int type = p[0] & 0x1f;
-		const uint8_t *sc = edge264_find_start_code(p, end, 0);
+		const uint8_t *sc = p + edge264mvc_find_start_code(p, (size_t)(end - p));
 		const uint8_t *nend = sc < end ? sc : end;
 		int is_vcl = is_base ? (type == 1 || type == 5) : (type == 20);
 		int pic_start = nal_is_pic_start(p, nend, type, is_base);
@@ -1531,14 +1584,14 @@ MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
 	}
 
 	/* decode the first frame for exact (post-crop) per-view dimensions */
-	s->dec = edge264_alloc(n_threads, NULL, NULL, 0, NULL, NULL, NULL);
-	if (!s->dec) { set_err(err, errsize, "edge264_alloc failed"); mvc_close(s); return NULL; }
+	s->dec = open_decoder(n_threads);
+	if (!s->dec) { set_err(err, errsize, "edge264mvc_open failed"); mvc_close(s); return NULL; }
 	s->nal = s->start; /* single-file feed position */
 	s->feed_si = 0;    /* two-file feed position (span index) */
 	s->next_out = 0;
 	s->valid_from = 0; /* a decode from the stream's start has no leading pictures to discard */
 	s->last_poc = INT64_MIN;
-	Edge264Frame f;
+	Picture f;
 	int rc = decode_next_output(s, &f, err, errsize);
 	if (rc <= 0) {
 		if (rc == 0) set_err(err, errsize, "failed to decode the first frame"); /* rc<0: err already set */
@@ -1584,7 +1637,7 @@ static int ensure_source_frame(MvcSource *s, int src_n, char *err, size_t errsiz
 		return -1;
 	}
 	for (;;) {
-		Edge264Frame f;
+		Picture f;
 		int rc = decode_next_output(s, &f, err, errsize);
 		if (rc <= 0) {
 			if (rc == 0) set_err(err, errsize, "unexpected end of stream while seeking"); /* rc<0: err already set */
@@ -1638,7 +1691,10 @@ int mvc_get_frame(MvcSource *s, int n,
 
 void mvc_close(MvcSource *s) {
 	if (!s) return;
-	if (s->dec) edge264_free(&s->dec);
+	if (s->dec) {
+		release_held(s);
+		edge264mvc_close(&s->dec);
+	}
 	ring_free(s);
 	free(s->idx);
 	free(s->ps);

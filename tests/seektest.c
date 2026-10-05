@@ -17,7 +17,7 @@
  *                and every slice fails ("unexpected end of stream"). [P4-M-1]
  *
  *   cut        : the stream cut mid-GOP so it begins with VCL slices that precede
- *                any SPS/PPS (the Alba.264 case). The decoder returns EBADMSG for
+ *                any SPS/PPS (the Alba.264 case). The decoder returns EDGE264MVC_CORRUPT for
  *                those (no frame), so scan_index must not count them; counting
  *                them overcounts num_frames, shifting every later display index
  *                and leaving the tail unreadable. Checked both ways: seek ==

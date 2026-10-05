@@ -141,7 +141,7 @@ clip = core.mvc.Source(r"base.264", dependent=r"dependent.mvc", stack="tab")
 ```
 
 Signature: `core.mvc.Source(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=0, cachesize=512, dependent="", showprogress=1)`.
-`threads` is edge264's internal decode parallelism (`-1` auto-detect cores, `0`
+`threads` is edge264-mvc's internal decode parallelism (`-1` auto-detect cores, `0`
 single-thread, or an explicit count); `cachesize` is the decoded-frame cache
 ceiling in MiB (raise it for smoother backward / `Reverse()` seeking on
 long-GOP streams, lower it to save memory). `showprogress` logs the indexing
@@ -168,7 +168,7 @@ Signature: `MVCSource(source, stack="base", threads=-1, fpsnum=..., fpsden=..., 
 AviSynth+ C interface has no log channel), visible in CLI hosts such as
 avs2yuv, x264 or ffmpeg.
 
-`fpsnum`/`fpsden` must be given together (edge264's public API does not expose
+`fpsnum`/`fpsden` must be given together (edge264-mvc's public API does not expose
 the VUI rate); the default is 24000/1001.
 
 ## Building
@@ -185,10 +185,10 @@ make EDGE264_SRC=/path/to/edge264-mvc     # builds both plugins + the core tests
 
 Individual targets: `make libvsmvc.so` (VapourSynth), `make libavsmvc.so`
 (AviSynth+). Tested on Linux; CI builds and bit-exact-verifies both plugins
-against edge264-mvc `v2026.09.22` and AviSynth+ `v3.7.3`.
+against edge264-mvc `v2026.10.05` and AviSynth+ `v3.7.3`.
 
 The **released** binaries target a portable `x86-64-v2` floor (SSE4.2, runs on
-~2009-and-later CPUs), with edge264's runtime dispatch lifting the parser to AVX2
+~2009-and-later CPUs), with edge264-mvc's runtime dispatch lifting the parser to AVX2
 (`x86-64-v3`) where the CPU supports it - so one binary runs across CPU
 generations at full speed on modern hardware. A plain local `make` instead builds
 for the build machine (`-march=native`); to reproduce the portable release ISA

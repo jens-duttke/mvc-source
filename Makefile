@@ -24,7 +24,7 @@ WINDRES   ?= x86_64-w64-mingw32-windres
 CFLAGS    ?= -O2 -std=gnu11 -Wall -Wextra
 EDGE264_SRC ?= ../edge264
 
-EDGE264_A := $(EDGE264_SRC)/libedge264.a
+EDGE264_A := $(EDGE264_SRC)/libedge264mvc.a
 # Extra args passed to the edge264 sub-make; set OS=windows (+ a MinGW CC) for a
 # Windows cross-build, e.g. EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc".
 EDGE264_MAKE ?=
@@ -181,23 +181,23 @@ mockhost-asan: tests/mockhost.c
 seektest: tests/seektest.c src/mvcsource.c src/mvcsource.h src/h264poc.h $(EDGE264_A)
 	$(CC) $(CFLAGS) $(INCLUDES) tests/seektest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
-# ENOMEM-handling test: --wrap intercepts edge264_decode_NAL to inject ENOMEM on
+# NOMEM-handling test: --wrap intercepts edge264mvc_send_nal to inject NOMEM on
 # a chosen slice, so the caller loop's data-loss handling is checked without real
 # memory pressure. Committed fixture, no TEST_FILE.
 enomemtest: tests/enomemtest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
-	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264_decode_NAL \
+	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264mvc_send_nal \
 	    tests/enomemtest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
-# Decoder-allocation-failure test: --wrap intercepts edge264_alloc to fail the
+# Decoder-allocation-failure test: --wrap intercepts edge264mvc_open to fail the
 # seek-time reallocation, checking the alloc-failure error and retry recovery.
 allocfailtest: tests/allocfailtest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
-	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264_alloc \
+	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264mvc_open \
 	    tests/allocfailtest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
-# Display-order tripwire test: --wrap intercepts edge264_get_frame to force a
-# non-monotone DisplayPoc, checking the output-count divergence is caught.
+# Display-order tripwire test: --wrap intercepts edge264mvc_receive_frame to force
+# a non-monotone display order, checking the output-count divergence is caught.
 poctest: tests/poctest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
-	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264_get_frame \
+	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264mvc_receive_frame \
 	    tests/poctest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
 # POC parser unit test. src/h264poc.h compiles standalone (like cache_budget.h),
@@ -206,12 +206,12 @@ poctest: tests/poctest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
 h264poctest: tests/h264poctest.c src/h264poc.h
 	$(CC) $(CFLAGS) -Isrc tests/h264poctest.c -o $@
 
-# ENOBUFS-stall test: --wrap intercepts both edge264 entry points to hold the
-# decoder in a persistent-ENOBUFS / no-frame state (a DPB stuck full of incomplete
+# AGAIN-stall test: --wrap intercepts both decoder entry points to hold the
+# decoder in a persistent-AGAIN / no-frame state (a DPB stuck full of incomplete
 # pictures), checking the caller loop's progress guard fails loudly instead of
 # spinning forever. Committed fixture, no TEST_FILE.
 stalltest: tests/stalltest.c src/mvcsource.c src/mvcsource.h $(EDGE264_A)
-	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264_decode_NAL -Wl,--wrap=edge264_get_frame \
+	$(CC) $(CFLAGS) $(INCLUDES) -Wl,--wrap=edge264mvc_send_nal -Wl,--wrap=edge264mvc_receive_frame \
 	    tests/stalltest.c src/mvcsource.c $(EDGE264_A) -pthread -o $@
 
 # On-disk index-cache regression: cache hit == fresh scan, and a corrupt / stale
@@ -241,7 +241,7 @@ check: coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfail
 	sh tests/mkcheck.sh "$(EDGE264_SRC)"
 	@echo "== seek regression (headerless-GOP / AUD-headed / open-GOP, committed fixtures) =="
 	./seektest tests/fixtures/base_multigop.264 tests/fixtures/base_opengop.264
-	@echo "== ENOMEM handling (injected via --wrap) =="
+	@echo "== NOMEM handling (injected via --wrap) =="
 	./enomemtest tests/fixtures/base_multigop.264
 	@echo "== decoder alloc-failure handling (injected via --wrap) =="
 	./allocfailtest tests/fixtures/base_multigop.264
@@ -249,7 +249,7 @@ check: coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfail
 	./poctest tests/fixtures/base_multigop.264
 	@echo "== POC parser unit test (hand-written bits, no bitstream) =="
 	./h264poctest
-	@echo "== ENOBUFS-stall progress guard (injected via --wrap) =="
+	@echo "== AGAIN-stall progress guard (injected via --wrap) =="
 	./stalltest tests/fixtures/base_multigop.264
 	@echo "== on-disk index cache (miss/hit + corrupt/stale, committed fixture) =="
 	./cachetest tests/fixtures/base_multigop.264
@@ -285,7 +285,7 @@ endif
 # Bit-exact cross-check: the decode core's frame must match edge264's own decode
 # of the same frame. The reference is regenerated from edge264 on the fly (no
 # committed MD5, which would rot across edge264 versions / test files). Needs
-# edge264_test (built here) and ffmpeg. The CI additionally runs the equivalent
+# edge264mvc_test (built here) and ffmpeg. The CI additionally runs the equivalent
 # check through a real vspipe.
 BITEXACT_FRAME ?= 5
 check-bitexact: coretest
@@ -293,12 +293,12 @@ ifndef TEST_FILE
 	@echo "set TEST_FILE=<file.264> to run the bit-exact check, e.g. make check-bitexact TEST_FILE=movie.264"
 	@exit 1
 endif
-	$(MAKE) -C $(EDGE264_SRC) STATIC=yes BUILDTEST=no edge264_test
+	$(MAKE) -C $(EDGE264_SRC) STATIC=yes BUILDTEST=no edge264mvc_test
 	@set -e; \
 	  core=$$(mktemp); ref=$$(mktemp); \
 	  trap 'rm -f "$$core" "$$ref"' EXIT; \
 	  ./coretest "$(TEST_FILE)" 0 $(BITEXACT_FRAME) "$$core"; \
-	  sh tests/mkref.sh "$(EDGE264_SRC)/edge264_test" "$(TEST_FILE)" $(BITEXACT_FRAME) "$$ref"; \
+	  sh tests/mkref.sh "$(EDGE264_SRC)/edge264mvc_test" "$(TEST_FILE)" $(BITEXACT_FRAME) "$$ref"; \
 	  a=$$(md5sum < "$$core"); b=$$(md5sum < "$$ref"); \
 	  echo "core=$$a"; echo "ref =$$b"; \
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264: OK" || { echo "MISMATCH"; exit 1; }
@@ -315,12 +315,12 @@ endif
 	@echo "== AviSynth+ end-to-end (real runtime: properties, layouts, error paths) =="
 	./avshost ./$(AVS_PLUGIN) "$(TEST_FILE)" tab
 	@echo "== bit-exact vs edge264 through AviSynth+ =="
-	$(MAKE) -C $(EDGE264_SRC) STATIC=yes BUILDTEST=no edge264_test
+	$(MAKE) -C $(EDGE264_SRC) STATIC=yes BUILDTEST=no edge264mvc_test
 	@set -e; \
 	  avs=$$(mktemp); ref=$$(mktemp); \
 	  trap 'rm -f "$$avs" "$$ref"' EXIT; \
 	  ./avshost ./$(AVS_PLUGIN) "$(TEST_FILE)" base $(BITEXACT_FRAME) "$$avs"; \
-	  sh tests/mkref.sh "$(EDGE264_SRC)/edge264_test" "$(TEST_FILE)" $(BITEXACT_FRAME) "$$ref"; \
+	  sh tests/mkref.sh "$(EDGE264_SRC)/edge264mvc_test" "$(TEST_FILE)" $(BITEXACT_FRAME) "$$ref"; \
 	  a=$$(md5sum < "$$avs"); b=$$(md5sum < "$$ref"); \
 	  echo "avs (AviSynth+): $$a"; echo "edge264 ref:     $$b"; \
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264: OK" || { echo "MISMATCH"; exit 1; }

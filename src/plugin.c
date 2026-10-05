@@ -12,7 +12,7 @@
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
 #include "mvcsource.h"
-#include "edge264.h" /* guard: the glue's callback names must not shadow edge264's public API */
+#include "edge264mvc.h" /* guard: the glue's callback names must not shadow edge264-mvc's public API */
 
 typedef struct {
 	MvcSource *src;

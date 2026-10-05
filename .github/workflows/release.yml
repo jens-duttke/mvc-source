@@ -19,7 +19,7 @@ permissions:
 env:
   # edge264-mvc release the binaries are built against. Keep in sync with
   # tests.yml's EDGE264_REF; bump both to the matching edge264-mvc tag.
-  EDGE264_REF: v2026.09.22
+  EDGE264_REF: v2026.10.05
   # Portable ISA for the DISTRIBUTED Linux .so builds. edge264's native build
   # injects -march=native, which bakes in whatever ISA the CI runner happens to
   # have; a runner with AVX-512 once produced a .so that crashed with SIGILL on
@@ -58,7 +58,7 @@ jobs:
         # AVX-512. In 64-bit code the opcode byte 0x62 is the EVEX prefix - but 0x62
         # also occurs as the first byte of relocated pointer DATA that objdump's
         # linear sweep frames inside .text (e.g. the function-pointer setup in
-        # edge264_alloc) as a bare, undecodable "addr:\t62 xx xx xx" line with NO
+        # edge264mvc_open) as a bare, undecodable "addr:\t62 xx xx xx" line with NO
         # mnemonic - too short to be a valid EVEX op, and objdump resyncs on the
         # next real instruction (confirmed data, not code, on binutils 2.42). A real
         # AVX-512 instruction always disassembles to a mnemonic; these artifacts

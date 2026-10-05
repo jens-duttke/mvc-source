@@ -15,14 +15,14 @@ PLUGIN_SO="libvsmvc.so"
 fail=0
 
 # --- M6: edge264 sub-make delegation --------------------------------------
-A="$EDGE264_SRC/libedge264.a"
+A="$EDGE264_SRC/libedge264mvc.a"
 if [ ! -f "$A" ]; then
 	make EDGE264_SRC="$EDGE264_SRC" "$A" >/dev/null 2>&1 || true
 fi
 if make -n EDGE264_SRC="$EDGE264_SRC" coretest 2>/dev/null | grep -q "STATIC=yes"; then
 	echo "ok[makefile]: edge264 sub-make is always delegated (no stale .a)"
 else
-	echo "FAIL[makefile]: a stale libedge264.a would be linked (sub-make not re-run when .a exists)"
+	echo "FAIL[makefile]: a stale libedge264mvc.a would be linked (sub-make not re-run when .a exists)"
 	fail=1
 fi
 

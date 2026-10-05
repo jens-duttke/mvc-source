@@ -8,27 +8,27 @@
  * wrong index, silently. The source now verifies DisplayPoc never decreases
  * across a decode run and fails loudly on a backward step.
  *
- * edge264_get_frame is intercepted via the linker's --wrap so one output's
- * DisplayPoc is forced non-monotone, standing in for any such divergence.
+ * edge264mvc_receive_frame is intercepted via the linker's --wrap so one output's
+ * display_order is forced non-monotone, standing in for any such divergence.
  *
  * usage: poctest <base_multigop.264>
  *
  * Copyright (c) 2026 Jens Duttke. BSD-3-Clause (see LICENSE).
  */
 #include "mvcsource.h"
-#include "edge264.h"
+#include "edge264mvc.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-int __real_edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow);
+int __real_edge264mvc_receive_frame(Edge264MvcDecoder *dec, Edge264MvcFrame *out);
 
 static int g_corrupt_next_poc = 0;
 
-int __wrap_edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
-	int r = __real_edge264_get_frame(dec, out, borrow);
-	if (r == 0 && g_corrupt_next_poc) { g_corrupt_next_poc = 0; out->DisplayPoc = -1; }
+int __wrap_edge264mvc_receive_frame(Edge264MvcDecoder *dec, Edge264MvcFrame *out) {
+	int r = __real_edge264mvc_receive_frame(dec, out);
+	if (r == EDGE264MVC_OK && g_corrupt_next_poc) { g_corrupt_next_poc = 0; out->views[0].display_order = -1; }
 	return r;
 }
 
@@ -45,7 +45,7 @@ int main(int argc, char **argv) {
 	for (int i = 1; i <= 2 && i < N; i++)
 		if (mvc_get_frame(s, i, Y, W, U, CW, V, CW, err, sizeof err)) { fprintf(stderr, "read %d: %s\n", i, err); return 2; }
 
-	/* now force the next output's DisplayPoc backwards - must be caught */
+	/* now force the next output's display order backwards - must be caught */
 	g_corrupt_next_poc = 1;
 	int caught = 0;
 	for (int i = 3; i < N; i++) {

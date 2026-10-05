@@ -1,7 +1,7 @@
 /*
  * allocfailtest - regression tests for decoder-allocation failure during a seek.
  *
- * A seek tears the decoder down and recreates it. If edge264_alloc fails (OOM),
+ * A seek tears the decoder down and recreates it. If edge264mvc_open fails (OOM),
  * reset_decoder returns failure - and seek_to must handle it without ever
  * decoding against the resulting NULL decoder. Two scenarios:
  *
@@ -18,7 +18,7 @@
  *                    the allocation (persistent, non-self-healing). The seek must
  *                    force a restart whenever the decoder is absent.
  *
- * edge264_alloc is intercepted via the linker's --wrap so the seek-time
+ * edge264mvc_open is intercepted via the linker's --wrap so the seek-time
  * reallocation fails deterministically, without real memory pressure.
  *
  * usage: allocfailtest <base_multigop.264>   (fixture seek points: IDRs at 0,3,6,9)
@@ -26,21 +26,19 @@
  * Copyright (c) 2026 Jens Duttke. BSD-3-Clause (see LICENSE).
  */
 #include "mvcsource.h"
-#include "edge264.h"
+#include "edge264mvc.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-Edge264Decoder *__real_edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
-	int log_mbs, Edge264AllocCb alloc_cb, Edge264FreeCb free_cb, void *alloc_arg);
+int __real_edge264mvc_open(Edge264MvcDecoder **decoder, const Edge264MvcSettings *settings);
 
 static int g_fail_next_alloc = 0;
 
-Edge264Decoder *__wrap_edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
-	int log_mbs, Edge264AllocCb alloc_cb, Edge264FreeCb free_cb, void *alloc_arg) {
-	if (g_fail_next_alloc) { g_fail_next_alloc = 0; return NULL; }
-	return __real_edge264_alloc(n_threads, log_cb, log_arg, log_mbs, alloc_cb, free_cb, alloc_arg);
+int __wrap_edge264mvc_open(Edge264MvcDecoder **decoder, const Edge264MvcSettings *settings) {
+	if (g_fail_next_alloc) { g_fail_next_alloc = 0; *decoder = NULL; return EDGE264MVC_NOMEM; }
+	return __real_edge264mvc_open(decoder, settings);
 }
 
 static uint64_t fnv_plane(const uint8_t *p, ptrdiff_t stride, int w, int h) {
@@ -76,7 +74,7 @@ static int test_reset_retry(const char *path) {
 	uint8_t *Y = malloc((size_t)W * H), *U = malloc((size_t)CW * CH), *V = malloc((size_t)CW * CH);
 
 	/* full forward decode so next_out is at the end; then a backward seek forces
-	 * reset_decoder -> edge264_alloc, which we make fail. */
+	 * reset_decoder -> edge264mvc_open, which we make fail. */
 	if (mvc_get_frame(s, N - 1, Y, W, U, CW, V, CW, err, sizeof err)) {
 		printf("FAIL[reset_retry]: read last failed: %s\n", err); mvc_close(s); free(Y); free(U); free(V); return 1;
 	}

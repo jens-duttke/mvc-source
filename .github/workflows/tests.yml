@@ -29,7 +29,7 @@ env:
   # edge264-mvc ref to build against; pinned to a release tag for reproducibility
   # (git clone --depth 1 --branch accepts tags/branches but NOT commit SHAs, so a
   # tag is required here). Bump when validating against a newer edge264-mvc.
-  EDGE264_REF: v2026.09.22
+  EDGE264_REF: v2026.10.05
   # AviSynth+ release to build the avisynth job against; pinned for reproducibility
   # and kept in sync with the vendored include/avisynth*.h headers. Bump both together.
   AVSPLUS_REF: v3.7.3
@@ -43,9 +43,9 @@ jobs:
     # AVX2 runtime dispatch, see release.yml), not a native build, so the
     # distributed build's correctness - not merely a native one's - is CI-verified.
     # Scoped to this job only: the vapoursynth/avisynth jobs build a native
-    # edge264_test reference in the same edge264 tree, and mixing its default
-    # VARIANTS=logs with a v2/v3 plugin build would re-archive libedge264.a without
-    # the variant objects the core references. This job builds no edge264_test.
+    # edge264mvc_test reference in the same edge264 tree, and mixing its default
+    # VARIANTS=logs with a v2/v3 plugin build would re-archive libedge264mvc.a without
+    # the variant objects the core references. This job builds no edge264mvc_test.
     env:
       EDGE264_MAKE: "VARIANTS=x86-64-v2,x86-64-v3 CFLAGS=-march=x86-64-v2"
     steps:
@@ -104,12 +104,12 @@ jobs:
       - name: Bit-exact vs edge264 through vspipe (regenerated reference)
         run: |
           sudo apt-get install -y ffmpeg
-          make -C ../edge264 STATIC=yes BUILDTEST=no edge264_test
+          make -C ../edge264 STATIC=yes BUILDTEST=no edge264mvc_test
           N=5   # keep in sync with the Makefile's BITEXACT_FRAME
           plugin=$(mktemp); ref=$(mktemp); trap 'rm -f "$plugin" "$ref"' EXIT
           vspipe -s $N -e $N -a plugin="$PWD/libvsmvc.so" -a source="$PWD/$TEST_FILE" -a stack=base tests/test.vpy "$plugin"
           # shared reference-extraction, same script the Makefile's check-bitexact uses
-          sh tests/mkref.sh ../edge264/edge264_test "$TEST_FILE" $N "$ref"
+          sh tests/mkref.sh ../edge264/edge264mvc_test "$TEST_FILE" $N "$ref"
           a=$(md5sum < "$plugin"); b=$(md5sum < "$ref")
           echo "plugin (vspipe): $a"; echo "edge264 ref:     $b"
           [ "$a" = "$b" ] && echo "bit-exact: OK" || { echo "bit-exact: MISMATCH"; exit 1; }
@@ -162,12 +162,12 @@ jobs:
           # plugins and the tests are C.
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64 wine64 ffmpeg
-      - name: Linux edge264_test (generates the bit-exact reference)
-        run: make -C ../edge264 STATIC=yes BUILDTEST=no edge264_test
+      - name: Linux edge264mvc_test (generates the bit-exact reference)
+        run: make -C ../edge264 STATIC=yes BUILDTEST=no edge264mvc_test
       - name: Cross-build edge264 for Windows (separate tree)
         run: |
           # a separate tree so the Windows objects do not clobber the Linux
-          # edge264_test built above (same object/.a names per OS).
+          # edge264mvc_test built above (same object/.a names per OS).
           cp -r ../edge264 ../edge264-win
           make -C ../edge264-win clean
           make -C ../edge264-win OS=windows CC=x86_64-w64-mingw32-gcc STATIC=yes BUILDTEST=no
@@ -196,7 +196,7 @@ jobs:
           N=5
           cp "$TEST_FILE" ./win_input.264
           wine coretest.exe win_input.264 0 $N win_frame.yuv
-          sh tests/mkref.sh ../edge264/edge264_test win_input.264 $N ref_frame.yuv
+          sh tests/mkref.sh ../edge264/edge264mvc_test win_input.264 $N ref_frame.yuv
           a=$(md5sum < win_frame.yuv); b=$(md5sum < ref_frame.yuv)
           echo "windows core (wine): $a"; echo "edge264 ref:         $b"
           [ "$a" = "$b" ] && echo "Windows core bit-exact: OK" || { echo "MISMATCH"; exit 1; }

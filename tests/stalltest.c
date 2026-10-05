@@ -1,60 +1,54 @@
 /*
- * stalltest - regression test for the ENOBUFS progress guard in the edge264
- * caller loop (decode_next_output).
+ * stalltest - regression test for the progress guard in the decoder caller loop
+ * (decode_next_output).
  *
- * A crafted / corrupt .264 can drive edge264 into a state where its output queue
- * is full of never-completed pictures: every edge264_decode_NAL returns ENOBUFS -
- * INCLUDING the end-of-stream flush sentinel (buf >= end), because edge264 checks
- * its per-view fullness gate BEFORE the drain branch that would arm the private
- * `flushing` flag - while edge264_get_frame drains nothing. The old guard "force
- * the flush sentinel" (s->nal = s->end) cannot escape this through the public API
- * (edge264's own test harness reaches into the private `flushing` flag, which
- * edge264.h does not expose), so the caller loop spun forever at ~100% CPU: a
- * source filter for untrusted media that can be driven into a hang is a DoS.
+ * A crafted / corrupt .264 could drive the decoder into a state where its output
+ * queue is full of never-completed pictures: every NAL sent - and the end of the
+ * stream too - is answered with "receive frames first" (EDGE264MVC_AGAIN under
+ * API v2, ENOBUFS under the edge264 API), while receiving drains nothing. A caller
+ * loop that simply resends spins forever at ~100% CPU: a source filter for
+ * untrusted media that can be driven into a hang is a DoS.
  *
- * Both edge264 entry points are intercepted via the linker's --wrap to reproduce
+ * Both decoder entry points are intercepted via the linker's --wrap to reproduce
  * the stuck state deterministically: real decode during open, then persistent
- * ENOBUFS with no frame emitted. The caller loop must terminate with a clear
- * error instead of spinning. A high escape threshold in the decode wrap makes the
- * unfixed (spinning) loop still return, so this test itself never hangs.
+ * EDGE264MVC_AGAIN with no frame emitted. The caller loop must terminate with a
+ * clear error instead of spinning. A high escape threshold in the send wrap makes
+ * an unguarded (spinning) loop still return, so this test itself never hangs.
  *
  * usage: stalltest <base_multigop.264>
  *
  * Copyright (c) 2026 Jens Duttke. BSD-3-Clause (see LICENSE).
  */
 #include "mvcsource.h"
-#include "edge264.h"
-#include <errno.h>
+#include "edge264mvc.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-int __real_edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf,
-	const uint8_t *end, Edge264UnrefCb unref_cb, void *unref_arg);
-int __real_edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow);
+int __real_edge264mvc_send_nal(Edge264MvcDecoder *dec, const uint8_t *nal, size_t size, int64_t pts, int64_t user_data);
+int __real_edge264mvc_receive_frame(Edge264MvcDecoder *dec, Edge264MvcFrame *out);
 
-/* When armed, every decode returns ENOBUFS and every get_frame drains nothing,
- * standing in for a DPB stuck full of incomplete pictures. The escape net turns
- * ENOBUFS into a fatal EINVAL after ESCAPE calls, so a still-spinning (unfixed)
+/* When armed, every send_nal returns EDGE264MVC_AGAIN and every receive_frame
+ * gives nothing, standing in for a DPB stuck full of incomplete pictures. The
+ * escape net turns AGAIN into a fatal EDGE264MVC_INVALID after ESCAPE calls, so a still-spinning (unfixed)
  * loop terminates the test instead of hanging it - the call count then reveals
  * whether the loop bailed at its guard (~65) or spun to the net. */
 #define ESCAPE 4000
 static int  g_stuck = 0;
 static long g_stuck_calls = 0;
 
-int __wrap_edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf,
-	const uint8_t *end, Edge264UnrefCb unref_cb, void *unref_arg) {
+int __wrap_edge264mvc_send_nal(Edge264MvcDecoder *dec, const uint8_t *nal, size_t size, int64_t pts, int64_t user_data) {
 	if (g_stuck) {
-		if (++g_stuck_calls > ESCAPE) return EINVAL; /* safety net: never hang the test */
-		return ENOBUFS;
+		if (++g_stuck_calls > ESCAPE) return EDGE264MVC_INVALID; /* safety net: never hang the test */
+		return EDGE264MVC_AGAIN;
 	}
-	return __real_edge264_decode_NAL(dec, buf, end, unref_cb, unref_arg);
+	return __real_edge264mvc_send_nal(dec, nal, size, pts, user_data);
 }
 
-int __wrap_edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
-	if (g_stuck) return EAGAIN; /* nonzero: no complete picture available to emit */
-	return __real_edge264_get_frame(dec, out, borrow);
+int __wrap_edge264mvc_receive_frame(Edge264MvcDecoder *dec, Edge264MvcFrame *out) {
+	if (g_stuck) return EDGE264MVC_AGAIN; /* no complete picture available to emit */
+	return __real_edge264mvc_receive_frame(dec, out);
 }
 
 int main(int argc, char **argv) {
@@ -81,7 +75,7 @@ int main(int argc, char **argv) {
 	printf("stuck-decode: rc=%d calls=%ld err=\"%s\"\n", rc, g_stuck_calls, err);
 
 	mvc_close(s); free(Y); free(U); free(V);
-	if (errored && !hung) { printf("RESULT: PASS (caller loop bailed on a persistent ENOBUFS stall, no spin)\n"); return 0; }
+	if (errored && !hung) { printf("RESULT: PASS (caller loop bailed on a persistent AGAIN stall, no spin)\n"); return 0; }
 	printf("RESULT: FAIL (errored=%d hung=%d calls=%ld)\n", errored, hung, g_stuck_calls);
 	return 1;
 }
