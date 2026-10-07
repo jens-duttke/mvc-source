@@ -1,263 +1,131 @@
-# mvc-source - AviSynth+ & VapourSynth MVC (3D Blu-ray) source plugins
+# mvc-source
 
-Source plugins for **H.264/AVC and MVC (3D Blu-ray, stereo)** video, built on
-the [edge264-mvc](https://github.com/jens-duttke/edge264-mvc) software decoder.
-One shared decode core drives two thin host plugins:
+mvc-source is a source plugin for **VapourSynth** and **AviSynth+** that decodes **H.264 MVC**, the stereoscopic 3D format of **3D Blu-ray** discs, and serves both eye views as a clip - one view, both stacked top-and-bottom or side by side, or alternating frame by frame. FFmpeg-based sources decode only the base view of these streams and drop the second eye, and the existing MVC sources (DGMVCsourceVS, FRIMSource) run only on Windows and need Intel's `libmfxsw64.dll`. mvc-source runs on Linux and Windows and has no runtime dependency: each plugin is a single `.so` / `.dll`. It also decodes ordinary 2D H.264.
 
-- **VapourSynth** (API4) - `core.mvc.Source(...)`, built as `libvsmvc.so`
-- **AviSynth+** - `MVCSource(...)`, built as `libavsmvc.so`
+It is built on the [edge264-mvc](https://github.com/jens-duttke/edge264-mvc) decoder, which is linked in statically.
 
-Its reason to exist: there is **no dependency-free MVC (3D Blu-ray) source for
-these frameservers on Linux**. FFmpeg drops the MVC dependent view entirely, and
-the existing options (DGMVCsourceVS, FRIMSource) are Windows-only and pull in
-`libmfxsw64.dll`. `mvc-source` decodes both views in pure, self-contained C:
-edge264 is statically linked, so each built plugin is a single shared library
-(`.so` on Linux, `.dll` on Windows) with no external runtime dependency.
+## Why mvc-source
 
-Intended workflow: decode a 3D Blu-ray's MVC stream, frame-serve the two views
-(e.g. as a top-and-bottom clip), interpolate (e.g. with
-[vs-rife](https://github.com/HolyWu/vs-rife)) and re-encode - fully on Linux.
+- **Both views, on Linux** - a 3D Blu-ray can be decoded, filtered (e.g. frame-interpolated with [vs-rife](https://github.com/HolyWu/vs-rife)) and re-encoded as 3D without leaving Linux.
+- **Exact output** - the frames are identical to those of edge264-mvc itself, which CI checks through a real `vspipe` and a real AviSynth+, and a seek gives exactly the frames of a decode in order.
+- **Fast seeking** - a seek starts decoding at the nearest IDR or recovery point, the entry points a 3D Blu-ray uses, and a frame cache serves backward and repeated access from memory. On a 3D Blu-ray film, a cold seek to the last frame takes about 0.2 s.
+- **Split streams** - a disc demuxed into a separate base-view `.264` and dependent-view `.mvc` (as tsMuxeR and BD3D2MK3D produce) is decoded directly, without remuxing the two files into one.
+- **Quick reopening** - the first open scans the whole stream to count its frames; the result is cached in a small `.mvcidx` file next to the source, so later opens start at once.
 
-## Status
+## Installation
 
-Working and verified end-to-end, **bit-exact against the edge264 reference on
-both hosts** (correct frame count, dimensions, frame-accurate seeking).
+Prebuilt binaries for Linux (x86-64) and Windows (x64) are attached to every [release](https://github.com/jens-duttke/mvc-source/releases):
 
-- [x] **Decode core** (`src/mvcsource.c`) - open, index, seek, and per-view /
-  stacked frame assembly on top of edge264. Host-independent; unit-tested
-  without any frameserver runtime (`tests/coretest.c`).
-- [x] **VapourSynth glue** (`src/plugin.c`) - the API4 filter `mvc.Source`.
-  Covered by `tests/mockhost.c` (drives the built plugin through the real API4)
-  and confirmed bit-exact in a real VapourSynth runtime (Core R77).
-- [x] **AviSynth+ glue** (`src/avisynth_plugin.c`) - the `MVCSource` filter,
-  written to the AviSynth **C interface** (not the C++ API) so a MinGW-cross-built
-  `.dll` loads in the official MSVC-built Windows AviSynth+; the C++ vtable ABI
-  does not match across GCC and MSVC. Loaded through a real AviSynth+ by
-  `tests/avshost.c` and confirmed bit-exact (AviSynth+ 3.7.3).
-- [x] **Windows build** - the AviSynth+ plugin cross-compiles with MinGW-w64 to a
-  self-contained `.dll` (only `avisynth_c_plugin_init` exported, edge264 hidden;
-  imports only `KERNEL32`/`msvcrt`/`AviSynth.dll`). Verified **bit-exact in the
-  official MSVC-built Windows AviSynth+ 3.7.3** end-to-end - both the Win32
-  file-mapping I/O path and the C-interface glue.
-- [x] **On-disk index cache** - a reopen of an unchanged stream skips the
-  full-file NAL scan (which must otherwise read the whole file to count frames):
-  the scan result is cached in a sidecar `<source>.mvcidx` next to the source,
-  keyed on the source's size + last-write time. Measured on a 1.4 GB MVC stream:
-  reopen dropped from a full-file scan to ~25 ms (the sidecar plus the first GOP),
-  bit-identical output. Writing is best-effort (a read-only directory simply
-  means no cache, never a failed open); a stale or corrupt sidecar is detected
-  and a fresh scan runs. Two-file input (below) is cached the same way, in a
-  `<dependent>.mvcidx` sidecar that also stores which of the two streams each
-  interleaved NAL came from - this matters a lot there, because a two-file open
-  scans *both* elementary streams end to end, so on a full-movie demux (a 25 GB
-  base + 13 GB dependent) the first open reads ~38 GB and takes minutes, while a
-  cached reopen is ~0.4 s.
-- [x] **Random-access seeking on every recovery point + decoded-frame cache** - a
-  seek decodes forward from the nearest preceding random-access point. Those are
-  not only IDRs: an open-GOP **recovery point** (a non-IDR I picture behind a
-  `recovery_point` SEI) is one too, and it is the entry point a 3D Blu-ray
-  actually uses - on a real disc, 341 of them against 103 IDRs over 7514 pictures,
-  cutting the worst-case span a cold seek must re-decode from **787 frames to 20**.
-  Using them needs the recovery point's display index, which is not its decode
-  index: its *leading pictures* follow it in decode order but precede it in
-  display order and reference the previous GOP, so a cold decode emits them, wrong,
-  before the recovery point itself. The scan therefore derives the picture order
-  count from the slice headers (no pixel decoding) and records, per seek point,
-  both the first display index a cold decode there yields and the first one that is
-  correct; the leading pictures in between are decoded and discarded, never cached
-  or served. A stream the POC derivation cannot model (field coding, an MMCO5 POC
-  reset) falls back to IDR-only seek points - slower on a long GOP, never wrong.
-  A bounded decoded-frame cache (`cachesize`, default 512 MiB, modelled on
-  BestSource's `cachesize`) holds independent frame copies that survive a decoder
-  reset, so backward / repeat / `Reverse()` access is served from RAM (~0.2 ms)
-  instead of re-decoding at all. A seek also re-feeds only the parameter sets still
-  *active* at its target rather than every one preceding it: they are scattered
-  across the whole file and a stream repeating them per IDR accumulates thousands
-  (2173 on a real disc, of which 4 are active), so feeding all of them costs a
-  random read each - the more so the slower the storage. Frame-accurate and
-  bit-exact against a sequential decode across the full JVT conformance corpus and
-  on real 3D Blu-rays. Measured on a 7514-picture 3D Blu-ray at the defaults: a
-  cold seek to the last frame dropped from 4.25 s to 0.18 s (0.41 s from the
-  recovery points, 0.18 s once the re-feed was narrowed), a `Reverse()` pass from
-  51.9 to ~155 fps, and the worst single-frame stall - what a user perceives as a
-  hang - from 2.21 s to 0.19 s. The gain is stream-dependent: a disc authored
-  without recovery points (one sample here) has no entry points between its IDRs
-  and is unchanged.
-- [x] **Two-file (split base + dependent view) input** - decode a 3D source that
-  was demuxed into two separate elementary streams (base `.264` + dependent
-  `.mvc`, as tsMuxeR / BD3D2MK3D produce) via the `dependent` argument, without an
-  on-disk remux. The two memory-mapped streams are interleaved per access unit
-  into the combined MVC stream the decoder expects, and the interleave is cached
-  in a sidecar next to the dependent stream so a reopen skips the full scan of
-  both files. Seek points land on every random-access point - IDRs *and* open-GOP
-  recovery points, exactly as for a combined stream: the POC derivation behind
-  recovery-point seeking is a base-view quantity, so it runs on the base stream's
-  slice headers alone (with the same IDR-only fallback for streams it cannot
-  model). A pair cut mid-stream can begin with an orphan dependent access unit
-  whose base picture lies before the cut; the interleave detects it (the base
-  stream starts at an IDR, whose dependent counterpart must be an anchor
-  picture) and keeps the base/dependent pairing aligned instead of shifting
-  every dependent view by one. Bit-exact against the single-file (combined)
-  decode of the same stream on a real tsMuxeR demux, all layouts, including
-  cold seeks (`tests/twofiletest.c`).
-- [ ] VUI frame-rate auto-detection.
+| File | Host | Platform |
+|---|---|---|
+| `libvsmvc.so` | VapourSynth | Linux |
+| `libvsmvc.dll` | VapourSynth | Windows |
+| `libavsmvc.so` | AviSynth+ | Linux |
+| `libavsmvc.dll` | AviSynth+ | Windows |
+
+The VapourSynth plugin is also available through VSRepo:
+
+```sh
+vsrepo install mvc-source
+```
+
+The binaries run on any x86-64 CPU from about 2009 onwards (`x86-64-v2`) and use AVX2 where the CPU has it.
 
 ## Usage
 
-Both plugins expose the same layouts and options; only the call syntax differs
-per host.
-
-`stack` selects the layout: `"base"` (left/2D), `"right"`, `"tab"`
-(top-and-bottom), `"sbs"` (side-by-side) or `"alt"` (alternating frames: base,
-dependent, base, dependent ... - twice the frames at twice the frame rate). On a
-2D stream the stacked/alternating modes fall back to the single view. `swaplr`
-swaps the two views in any layout (base <-> dependent), so a stream authored
-right-eye-first can be flipped without re-authoring.
-
-**Two input forms.** `source` is normally a single **combined** MVC elementary
-stream that already carries both views interleaved (what a 3D Blu-ray's `SSIF`
-yields). If instead the disc was demuxed into **two separate** elementary streams
-- a base-view `.264` and a dependent-view `.mvc`, as tsMuxeR / BD3D2MK3D produce -
-pass the dependent stream as the `dependent` argument. The two are interleaved in
-memory, per access unit, into the combined stream the decoder expects: no on-disk
-remux and no extra disk space, and (both files being memory-mapped) no copy of the
-multi-GB streams. Omitting `dependent` decodes `source` as a single stream (2D, or
-an already-combined MVC stream) exactly as before.
+The input is a raw H.264 elementary stream (Annex B, usually `.264`, `.h264` or `.mvc`), not a container such as `.m2ts` or `.mkv` - demux the video stream first. It is either a single stream that carries both views, or a base-view stream plus a separate dependent-view stream passed as `dependent`.
 
 ### VapourSynth
 
 ```python
 import vapoursynth as vs
 core = vs.core
-core.std.LoadPlugin("/path/to/libvsmvc.so")
 
-# base + dependent views stacked top-and-bottom (full resolution per eye)
-clip = core.mvc.Source(r"movie.264", stack="tab")
+# both views, top-and-bottom
+clip = core.mvc.Source("movie.264", stack="tab")
 
-# two separate streams from a tsMuxeR demux (base .264 + dependent .mvc):
-clip = core.mvc.Source(r"base.264", dependent=r"dependent.mvc", stack="tab")
-
-# ... interpolate to 60000/1001 with vs-rife, then output/encode ...
+# a demux into two files (base view + dependent view)
+clip = core.mvc.Source("movie.264", dependent="movie.mvc", stack="tab")
 ```
 
-Signature: `core.mvc.Source(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=0, cachesize=512, dependent="", showprogress=1)`.
-`threads` is edge264-mvc's internal decode parallelism (`-1` auto-detect cores, `0`
-single-thread, or an explicit count); `cachesize` is the decoded-frame cache
-ceiling in MiB (raise it for smoother backward / `Reverse()` seeking on
-long-GOP streams, lower it to save memory). `showprogress` logs the indexing
-scan's progress ("index progress N%") through VapourSynth's log, which vspipe
-and the VapourSynth Editor display; the scan only runs the first time a stream
-is opened (a reopen loads the `.mvcidx` sidecar and logs nothing), so pass
-`showprogress=0` if even that first open should stay silent.
+If the plugin is not installed in VapourSynth's plugin directory, load it first with `core.std.LoadPlugin("/path/to/libvsmvc.so")`.
 
 ### AviSynth+
 
 ```avisynth
-LoadPlugin("/path/to/libavsmvc.so")
+LoadPlugin("/path/to/libavsmvc.so")  # libavsmvc.dll on Windows
 
-# base + dependent views stacked top-and-bottom (full resolution per eye)
 MVCSource("movie.264", stack="tab")
-
-# two separate streams from a tsMuxeR demux (base .264 + dependent .mvc):
-MVCSource("base.264", dependent="dependent.mvc", stack="tab")
+MVCSource("movie.264", dependent="movie.mvc", stack="tab")
 ```
 
-Signature: `MVCSource(source, stack="base", threads=-1, fpsnum=..., fpsden=..., swaplr=false, cachesize=512, dependent="", showprogress=true)`.
-`threads` and `cachesize` behave as for the VapourSynth signature above.
-`showprogress` prints the first open's indexing progress to stderr (the
-AviSynth+ C interface has no log channel), visible in CLI hosts such as
-avs2yuv, x264 or ffmpeg.
+### Parameters
 
-`fpsnum`/`fpsden` must be given together (edge264-mvc's public API does not expose
-the VUI rate); the default is 24000/1001.
+Both hosts take the same parameters:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `source` | | the H.264 stream; with `dependent`, its base view |
+| `stack` | `"base"` | `"base"` (left eye / 2D), `"right"`, `"tab"` (top-and-bottom), `"sbs"` (side by side) or `"alt"` (base and dependent view alternating, twice the frames at twice the frame rate). A 2D stream returns its only view in every layout. |
+| `swaplr` | off | swap the two views, for a stream authored right eye first |
+| `dependent` | | the dependent-view stream of a two-file demux |
+| `fpsnum`, `fpsden` | 24000 / 1001 | the frame rate, given together; it is not read from the stream yet |
+| `threads` | -1 | decoding threads: -1 one per CPU core, 0 single-threaded, N exactly N |
+| `cachesize` | 512 | size of the decoded-frame cache in MiB; more makes backward access smoother on streams with long GOPs |
+| `showprogress` | on | report the progress of the first-open scan, through VapourSynth's log (shown by vspipe and VapourSynth Editor) or, for AviSynth+, on stderr |
+
+The output is 8-bit YUV 4:2:0 at the full resolution of each view, so a `tab` clip of a 1080p film is 1920x2160.
+
+## Supported streams
+
+mvc-source decodes what edge264-mvc decodes: the **Progressive High** and **Stereo High** (MVC, 2 views) profiles of H.264, 8-bit 4:2:0, which covers 3D Blu-ray and nearly all 2D H.264 in use. Interlaced coding, higher bit depths and 4:2:2 / 4:4:4 chroma are not supported.
 
 ## Building
 
-Requires a C compiler and an
-[edge264-mvc](https://github.com/jens-duttke/edge264-mvc) source tree (pin a
-release tag for reproducible builds). The VapourSynth API4 and AviSynth+ SDK
-headers are vendored under `include/`, so no host install is needed to build.
+Building needs a C compiler and an [edge264-mvc](https://github.com/jens-duttke/edge264-mvc) source tree; pin a release tag for a reproducible build. The VapourSynth and AviSynth+ SDK headers are included, so neither host has to be installed.
 
 ```sh
-make EDGE264_SRC=/path/to/edge264-mvc     # builds both plugins + the core tests
-./coretest movie.264 2                     # 0=base 1=right 2=tab 3=sbs 4=alt
+make EDGE264_SRC=/path/to/edge264-mvc   # both plugins and the tests
+make libvsmvc.so                        # only the VapourSynth plugin
+make libavsmvc.so                       # only the AviSynth+ plugin
 ```
 
-Individual targets: `make libvsmvc.so` (VapourSynth), `make libavsmvc.so`
-(AviSynth+). Tested on Linux; CI builds and bit-exact-verifies both plugins
-against edge264-mvc `v2026.10.06` and AviSynth+ `v3.7.3`.
+A local build targets the build machine (`-march=native`). To build the portable binaries of the releases, add `EDGE264_MAKE="VARIANTS=x86-64-v2,x86-64-v3 CFLAGS=-march=x86-64-v2"`.
 
-The **released** binaries target a portable `x86-64-v2` floor (SSE4.2, runs on
-~2009-and-later CPUs), with edge264-mvc's runtime dispatch lifting the parser to AVX2
-(`x86-64-v3`) where the CPU supports it - so one binary runs across CPU
-generations at full speed on modern hardware. A plain local `make` instead builds
-for the build machine (`-march=native`); to reproduce the portable release ISA
-pass `EDGE264_MAKE="VARIANTS=x86-64-v2,x86-64-v3 CFLAGS=-march=x86-64-v2"`.
+### Windows
 
-### Windows cross-build (MinGW-w64)
-
-The AviSynth+ plugin cross-compiles from Linux to a self-contained Windows `.dll`
-that loads in the official MSVC-built AviSynth+ - it uses the AviSynth C interface
-precisely so the GCC/MSVC C++ ABI mismatch does not apply. Needs
-`gcc-mingw-w64-x86-64` (and its `binutils` for `dlltool`); no `AviSynth.dll` is
-needed at build time - the import library is generated from
-`src/avisynth_win.def`.
+The Windows DLLs are cross-compiled on Linux with MinGW-w64 (`gcc-mingw-w64-x86-64`). The AviSynth+ plugin uses the AviSynth C interface, so the MinGW-built DLL loads in the official MSVC-built AviSynth+.
 
 ```sh
-# edge264 for Windows - a separate tree keeps its objects apart from a Linux build:
+# edge264-mvc for Windows, in a separate tree
 cp -r ../edge264 ../edge264-win && make -C ../edge264-win clean
 make -C ../edge264-win OS=windows CC=x86_64-w64-mingw32-gcc STATIC=yes BUILDTEST=no
-# the plugin DLL:
-make libavsmvc.dll CC=x86_64-w64-mingw32-gcc DLLTOOL=x86_64-w64-mingw32-dlltool \
+
+# the plugins
+make libavsmvc.dll libvsmvc.dll CC=x86_64-w64-mingw32-gcc \
+    DLLTOOL=x86_64-w64-mingw32-dlltool \
     EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
 ```
 
-The `windows-cross` CI job runs exactly this, verifies the DLL's exports, and runs
-the core under Wine bit-exact vs an edge264 reference. `make coretest.exe` (same
-MinGW flags) builds the standalone core test as a Windows binary. The DLL was
-additionally verified bit-exact in a real MSVC-built Windows AviSynth+.
-
-## Testing
+## Tests
 
 ```sh
-make check TEST_FILE=movie.264       # core (all layouts, seek==sequential) +
-                                     # VapourSynth glue via the mock API4 host
-make check-bitexact TEST_FILE=movie.264   # core frame md5 == an edge264 reference
-
-# end-to-end through a real AviSynth+ (needs libavisynth + ffmpeg); properties,
-# all layouts, error paths, then a bit-exact frame md5 vs edge264:
-make check-avs TEST_FILE=movie.264
+make check TEST_FILE=movie.264            # decode core + VapourSynth plugin (mock host)
+make check-bitexact TEST_FILE=movie.264   # frame checksum against edge264-mvc
+make check-avs TEST_FILE=movie.264        # AviSynth+ plugin in a real AviSynth+
 ```
 
-`make check` needs no frameserver install. The real-runtime proofs
-(`vspipe` for VapourSynth, `check-avs` for AviSynth+) run in CI.
-
-## Layout
-
-- `src/mvcsource.{c,h}` - the host-independent decode core (all the logic;
-  shared by both plugins, unit-testable without a frameserver runtime).
-- `src/plugin.c` - VapourSynth API4 glue (`mvc.Source`).
-- `src/avisynth_plugin.c` - AviSynth+ C-interface glue (`MVCSource`);
-  `src/avisynth_win.def` lists its C-API imports for the Windows cross-build.
-- `tests/coretest.c` - standalone core verification (info, sequential decode,
-  seek == sequential, raw-frame dump for cross-checking).
-- `tests/mockhost.c` - a mock VapourSynth API4 host driving the built plugin.
-- `tests/avshost.c` - loads the built AviSynth+ plugin through a real AviSynth+.
-- `include/` - vendored VapourSynth API4 and AviSynth+ SDK headers.
+`make check` needs neither VapourSynth nor AviSynth+: it tests the decode core on all layouts (seeking must give the same frames as decoding in order, also for two-file input) and drives the VapourSynth plugin through a minimal mock host. CI additionally runs the plugin in a real VapourSynth and compares its frames with edge264-mvc, and runs the Windows build of the decode core under Wine.
 
 ## Related projects
 
-- **[Oku3D](https://oku3d.com)** - *watch everything in 3D.* A real-time 3D
-  media player from the same author, built on the same
-  [edge264-mvc](https://github.com/jens-duttke/edge264-mvc) decoder for native
-  H.264 MVC (3D Blu-ray) playback - and it turns *any* other 2D video or photo
-  into stereoscopic 3D on the fly with AI depth estimation, so your whole
-  library plays in 3D, not just MVC discs.
+- **[edge264-mvc](https://github.com/jens-duttke/edge264-mvc)** - the H.264 MVC decoder this plugin is built on.
+- **[Oku3D Media Player](https://oku3d.com/)** - a native 3D media player built on the same decoder, which plays 3D Blu-rays and converts any 2D video to stereoscopic 3D in real time.
+
+## Contributing
+
+Bug reports are welcome, especially for streams that do not decode correctly. Please name the source of the stream (e.g. the disc and the demuxer used) and the parameters of the call.
 
 ## License
 
-BSD-3-Clause (see [LICENSE](LICENSE)). Statically links edge264-mvc
-(BSD-3-Clause) and builds against vendored SDK headers: the VapourSynth SDK
-(LGPL-2.1-or-later) and the AviSynth+ headers (GPL-2.0-or-later, with the
-standard exception permitting independent plugins that use only the documented
-interfaces - which is exactly how this plugin uses them).
+mvc-source is distributed under the [BSD 3-Clause license](LICENSE). It statically links edge264-mvc (BSD-3-Clause) and includes the VapourSynth SDK headers (LGPL-2.1-or-later) and the AviSynth+ headers (GPL-2.0-or-later, with the exception that permits independent plugins using only the documented interfaces).
