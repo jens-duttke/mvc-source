@@ -117,7 +117,7 @@ static int test_false_restart_after_oom(const char *path) {
 	if (mvc_get_frame(s, 2, Y, W, U, CW, V, CW, err, sizeof err)) { printf("FAIL[false_restart]: read 2: %s\n", err); goto done; }
 
 	/* 2. read frame 8 with the alloc armed to fail: the seek jumps to IDR@6
-	 * (sp_frame=6 > next_out=3), and its reset reallocation fails - leaving the
+	 * (sp_valid=6 > next_out=3), and its reset reallocation fails - leaving the
 	 * decoder NULL and next_out at 3 (the restart aborts before updating it). */
 	g_fail_next_alloc = 1;
 	err[0] = 0;

@@ -38,6 +38,12 @@
  *                one: it shrinks the frame cache until nearly every reverse read
  *                is a cold seek onto a recovery point.
  *
+ *   opengop_cut: the same stream cut at its first recovery point, so it begins
+ *                with a non-IDR I picture whose leading pictures reference the
+ *                cut-off GOP. The decoder does not return them, so scan_index
+ *                must not count them: counting them shifts every display index
+ *                and leaves the tail unreadable. Checked like the mid-GOP cut.
+ *
  * The check is the project's core invariant: reading a frame after a seek must be
  * bit-identical to reading it in sequence. Every topology is driven two ways:
  * reading each frame in reverse from one source, and reading each frame from a
@@ -116,6 +122,42 @@ static size_t mid_gop_cut_offset(const uint8_t *src, size_t n) {
 			else if (seen_idr && type == 1 && (pay[1] & 0x80)) /* post-IDR AU start */
 				return (size_t)(p - src);
 		}
+		p = nx;
+	}
+	return 0;
+}
+
+/* Reads one Exp-Golomb code at bit `*bit` of p (no emulation prevention byte can
+ * occur this early in a slice header). */
+static unsigned read_ue(const uint8_t *p, size_t n, size_t *bit) {
+	int zeros = 0;
+	while (*bit < n * 8 && !(p[*bit >> 3] >> (7 - (*bit & 7)) & 1)) zeros++, (*bit)++;
+	(*bit)++;
+	unsigned v = 1;
+	for (int i = 0; i < zeros && *bit < n * 8; i++, (*bit)++)
+		v = v << 1 | (p[*bit >> 3] >> (7 - (*bit & 7)) & 1);
+	return v - 1;
+}
+
+/* Byte offset of the start code of the first NAL of the access unit holding the
+ * first non-IDR I picture (a recovery point on the open-GOP fixture, behind its
+ * SPS/PPS/SEI). Cutting the stream here makes it begin at that picture, with its
+ * leading pictures next. Returns 0 if none. */
+static size_t recovery_cut_offset(const uint8_t *src, size_t n) {
+	const uint8_t *end = src + n, *au = NULL;
+	int in_vcl = 0;
+	for (const uint8_t *p = find_sc(src, end); p < end; ) {
+		const uint8_t *pay = p + 3;                 /* NAL header byte */
+		const uint8_t *nx = find_sc(pay, end);
+		int type = nx - pay >= 1 ? pay[0] & 0x1f : 0;
+		int vcl = type >= 1 && type <= 5;
+		if (!vcl && (in_vcl || !au)) au = p, in_vcl = 0; /* first non-VCL NAL of an access unit */
+		if (type == 1 && nx - pay >= 2 && (pay[1] & 0x80)) {
+			size_t bit = 1;                         /* past first_mb_in_slice = 0, a single 1 bit */
+			if (read_ue(pay + 1, (size_t)(nx - pay - 1), &bit) % 5 == 2) /* slice_type I */
+				return (size_t)((in_vcl ? p : au) - src);
+		}
+		if (vcl) in_vcl = 1;
 		p = nx;
 	}
 	return 0;
@@ -224,9 +266,9 @@ static int decode_hashes(const char *label, const uint8_t *stream, size_t n,
  * fixture in the decoded-frame cache (its floor is 16 MiB - thousands of 64x64
  * pictures), so the reverse pass is served entirely from RAM and exercises the
  * cache instead of the seek. A fresh source per frame is the only way to put the
- * seek path itself under test, and an open-GOP fixture needs exactly that: a
- * recovery point's leading pictures are only ever emitted on a cold decode, so
- * serving one in place of the recovery point is invisible to a cached read.
+ * seek path itself under test, and an open-GOP fixture needs exactly that: only a
+ * cold decode starts at a recovery point, so numbering its output wrong, or
+ * serving a leading picture in its place, is invisible to a cached read.
  */
 static int check_cold_seek(const char *label, const uint8_t *stream, size_t n) {
 	enum { CAP = 256 };
@@ -251,7 +293,7 @@ static int check_cold_seek(const char *label, const uint8_t *stream, size_t n) {
 			uint64_t h = hashp(Y, W, W, H);
 			if (h != ref[i]) {
 				printf("FAIL[%s]: cold seek to frame %d returned WRONG content (%016llx != %016llx)"
-				       " - a recovery point's leading picture served in its place?\n",
+				       " - a seek point numbered wrong, or a leading picture served in its place?\n",
 				       label, i, (unsigned long long)h, (unsigned long long)ref[i]);
 				rc = 1;
 			}
@@ -265,33 +307,34 @@ static int check_cold_seek(const char *label, const uint8_t *stream, size_t n) {
 }
 
 /* On a mid-GOP cut the leading slices reference now-removed parameter sets and
- * cannot be decoded, so scan_index must not count them. Verify the cut's frames
- * are an exact contiguous suffix of the full stream's frames and that num_frames
- * reaches the real end - guarding the pre-SPS/PPS overcount regression (num_frames
+ * cannot be decoded, and on a cut at a recovery point its leading pictures are
+ * not returned by the decoder, so scan_index must count neither. Verify the cut's
+ * frames are an exact contiguous suffix of the full stream's frames and that
+ * num_frames reaches the real end - guarding the overcount regression (num_frames
  * too high -> shifted indices, unreadable tail). Returns 0 on success. */
-static int check_cut_count(const uint8_t *base, size_t n, size_t coff) {
+static int check_cut_count(const char *label, const uint8_t *base, size_t n, size_t coff) {
 	enum { CAP = 256 };
 	uint64_t bh[CAP], ch[CAP];
-	int bn = decode_hashes("cut-ref", base, n, bh, CAP);
-	int cn = decode_hashes("cut-count", base + coff, n - coff, ch, CAP);
+	int bn = decode_hashes(label, base, n, bh, CAP);
+	int cn = decode_hashes(label, base + coff, n - coff, ch, CAP);
 	if (bn < 0 || cn < 0) return 1;
-	if (cn == 0 || cn > bn) { printf("FAIL[cut]: cut has %d frames, full stream %d\n", cn, bn); return 1; }
+	if (cn == 0 || cn > bn) { printf("FAIL[%s]: cut has %d frames, full stream %d\n", label, cn, bn); return 1; }
 	int off = -1;
 	for (int i = 0; i <= bn - cn; i++)
 		if (ch[0] == bh[i]) { off = i; break; }
-	if (off < 0) { printf("FAIL[cut]: cut frame 0 matches no full-stream frame\n"); return 1; }
+	if (off < 0) { printf("FAIL[%s]: cut frame 0 matches no full-stream frame\n", label); return 1; }
 	for (int i = 0; i < cn; i++)
 		if (ch[i] != bh[off + i]) {
-			printf("FAIL[cut]: frame %d is not full-stream frame %d "
-			       "(num_frames overcounted the pre-SPS/PPS slices?)\n", i, off + i);
+			printf("FAIL[%s]: frame %d is not full-stream frame %d "
+			       "(num_frames overcounted pictures that never come out?)\n", label, i, off + i);
 			return 1;
 		}
 	if (off + cn != bn) {
-		printf("FAIL[cut]: num_frames=%d ends at full-stream %d, not %d\n", cn, off + cn, bn);
+		printf("FAIL[%s]: num_frames=%d ends at full-stream %d, not %d\n", label, cn, off + cn, bn);
 		return 1;
 	}
-	printf("ok[cut]: num_frames=%d = full-stream suffix [%d..%d], no pre-SPS/PPS overcount\n",
-	       cn, off, bn - 1);
+	printf("ok[%s]: num_frames=%d = full-stream suffix [%d..%d], no overcount\n",
+	       label, cn, off, bn - 1);
 	return 0;
 }
 
@@ -339,22 +382,29 @@ int main(int argc, char **argv) {
 	size_t coff = mid_gop_cut_offset(base, (size_t)n);
 	if (!coff) { printf("FAIL[cut]: fixture has no post-IDR non-IDR access unit\n"); fail = 1; }
 	else {
-		fail |= check_cut_count(base, (size_t)n, coff);
+		fail |= check_cut_count("cut", base, (size_t)n, coff);
 		fail |= check_seek_consistency("cut", base + coff, (size_t)n - coff);
 		fail |= check_cold_seek("cut_cold", base + coff, (size_t)n - coff);
 	}
 
 	free(base);
 
-	/* Open GOPs: seek points sit on recovery points, whose leading pictures must be
-	 * decoded and discarded rather than served. Only the cold-seek check can see
-	 * that - a cached reverse read never reaches the seek path at all. */
+	/* Open GOPs: seek points sit on recovery points, whose leading pictures the
+	 * decoder does not return, so the first frame out is the recovery point itself.
+	 * Only the cold-seek check can see that - a cached reverse read never reaches
+	 * the seek path at all. */
 	if (argc > 2) {
 		size_t ogn = 0;
 		uint8_t *og = read_file(argv[2], &ogn);
 		if (!og) return 2;
 		fail |= check_seek_consistency("opengop", og, ogn);
 		fail |= check_cold_seek("opengop_cold", og, ogn);
+		size_t roff = recovery_cut_offset(og, ogn);
+		if (!roff) { printf("FAIL[opengop_cut]: fixture has no non-IDR I picture\n"); fail = 1; }
+		else {
+			fail |= check_cut_count("opengop_cut", og, ogn, roff);
+			fail |= check_cold_seek("opengop_cut_cold", og + roff, ogn - roff);
+		}
 		free(og);
 	}
 

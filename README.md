@@ -82,7 +82,7 @@ mvc-source decodes what edge264-mvc decodes: the **Progressive High** and **Ster
 
 ## Building
 
-Building needs a C compiler and an [edge264-mvc](https://github.com/jens-duttke/edge264-mvc) source tree; pin a release tag for a reproducible build. The VapourSynth and AviSynth+ SDK headers are included, so neither host has to be installed.
+Building needs a C compiler and an [edge264-mvc](https://github.com/jens-duttke/edge264-mvc) source tree, `v2026.10.15` or later; pin a release tag for a reproducible build. The VapourSynth and AviSynth+ SDK headers are included, so neither host has to be installed.
 
 ```sh
 make EDGE264_SRC=/path/to/edge264-mvc   # both plugins and the tests

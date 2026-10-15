@@ -44,11 +44,14 @@ cannot stand in for it, being closed-GOP throughout.
 
 What it exists to catch: a recovery point's **leading pictures** follow it in
 decode order but precede it in display order and reference the previous GOP, so a
-cold decode emits them - wrong - before the recovery point itself. A seek point
-there is only usable together with the POC-derived display index that separates
-the two. Serving a leading picture as the recovery point is the regression v0.4.3
-shipped; this fixture reproduces it (verified: reintroducing that bug fails
-`seektest`'s `opengop_cold` check at frame 14).
+cold decode cannot get them right; the decoder decodes them without returning
+them, and the first frame out is the recovery point itself. A seek point there is
+only usable together with the POC-derived display index that separates the two.
+Serving a leading picture as the recovery point is the regression v0.4.3 shipped;
+this fixture reproduces it (verified: reintroducing that bug fails `seektest`'s
+`opengop_cold` check at frame 14). `seektest` also cuts the stream at its first
+recovery point (`opengop_cut`), where those leading pictures must not be counted
+at all.
 
 It must be driven by `check_cold_seek`, one fresh source per frame. A reverse read
 over one source does not reach the seek path at all: the decoded-frame cache holds
