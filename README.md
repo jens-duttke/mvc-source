@@ -74,11 +74,11 @@ Both hosts take the same parameters:
 | `cachesize` | 512 | size of the decoded-frame cache in MiB; more makes backward access smoother on streams with long GOPs |
 | `showprogress` | on | report the progress of the first-open scan, through VapourSynth's log (shown by vspipe and VapourSynth Editor) or, for AviSynth+, on stderr |
 
-The output is 8-bit YUV 4:2:0 at the full resolution of each view, so a `tab` clip of a 1080p film is 1920x2160.
+The output is 8-bit YUV 4:2:0 (4:2:2 for a 4:2:2 stream) at the full resolution of each view, so a `tab` clip of a 1080p film is 1920x2160.
 
 ## Supported streams
 
-mvc-source decodes what edge264-mvc decodes: the **Progressive High** and **Stereo High** (MVC, 2 views) profiles of H.264, 8-bit 4:2:0, which covers 3D Blu-ray and nearly all 2D H.264 in use. Interlaced coding, higher bit depths and 4:2:2 / 4:4:4 chroma are not supported.
+mvc-source decodes what edge264-mvc decodes: the **Progressive High**, **High 4:2:2** (8-bit, progressive) and **Stereo High** (MVC, 2 views) profiles of H.264, with 8-bit 4:2:0, 4:2:2 or monochrome video, which covers 3D Blu-ray and nearly all 2D H.264 in use. Interlaced coding, higher bit depths and 4:4:4 chroma are not supported.
 
 ## Building
 
