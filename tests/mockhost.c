@@ -599,8 +599,13 @@ int main(int argc, char **argv) {
 		vi->format.colorFamily, vi->format.bitsPerSample, vi->format.subSamplingW,
 		vi->format.subSamplingH, vi->format.numPlanes);
 	if (vi->width <= 0 || vi->height <= 0 || vi->numFrames <= 0) { printf("FAIL: bad vi\n"); fail = 1; }
+	/* YUV420P8, or YUV422P8 for a 4:2:2 stream (MOCKHOST_CHROMA=422) */
+	const char *chroma = getenv("MOCKHOST_CHROMA");
+	int want_422 = chroma && !strcmp(chroma, "422");
 	if (vi->format.colorFamily != cfYUV || vi->format.bitsPerSample != 8 ||
-	    vi->format.subSamplingW != 1 || vi->format.subSamplingH != 1) { printf("FAIL: format is not YUV420P8\n"); fail = 1; }
+	    vi->format.subSamplingW != 1 || vi->format.subSamplingH != (want_422 ? 0 : 1)) {
+		printf("FAIL: format is not %s\n", want_422 ? "YUV422P8" : "YUV420P8"); fail = 1;
+	}
 
 	/* fps pairing semantics (M1) */
 	test_fps_semantics(path, &fail);
@@ -641,8 +646,8 @@ int main(int argc, char **argv) {
 		if (fr) {
 			FILE *f = fopen(argv[5], "wb");
 			for (int p = 0; p < 3; p++) {
-				int pw = p ? vi->width >> 1 : vi->width;
-				int ph = p ? vi->height >> 1 : vi->height;
+				int pw = p ? vi->width >> vi->format.subSamplingW : vi->width;
+				int ph = p ? vi->height >> vi->format.subSamplingH : vi->height;
 				const uint8_t *pl = mock_getReadPtr(fr, p);
 				ptrdiff_t st = mock_getStride(fr, p);
 				for (int y = 0; y < ph; y++) fwrite(pl + (ptrdiff_t)y * st, 1, (size_t)pw, f);

@@ -265,6 +265,11 @@ check: coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfail
 	else echo "  (32-bit build unavailable: no -m32 / gcc-multilib; skipping)"; fi
 	@echo "== test.vpy argument guards (stub VapourSynth) =="
 	python3 tests/vpycheck.py
+	@echo "== 4:2:2 stream (edge264-mvc fixture): declared as YUV422P8, frames fill it exactly =="
+	@if [ -f "$(TEST_422)" ]; then \
+	    ./coretest "$(TEST_422)" 0 && \
+	    MOCKHOST_CHROMA=422 ASAN_OPTIONS=detect_leaks=1 ./mockhost-asan ./$(PLUGIN) "$(TEST_422)" base; \
+	else echo "  ($(TEST_422) missing: edge264-mvc older than v2026.10.17, which decodes no 4:2:2; skipping)"; fi
 ifndef TEST_FILE
 	@echo "set TEST_FILE=<file.264> to run the suite, e.g. make check TEST_FILE=movie.264"
 	@exit 1
@@ -288,6 +293,9 @@ endif
 # edge264mvc_test (built here) and ffmpeg. The CI additionally runs the equivalent
 # check through a real vspipe.
 BITEXACT_FRAME ?= 5
+# a 4:2:2 stream that edge264-mvc v2026.10.17 and later carries as a fixture (5 frames)
+TEST_422 ?= $(EDGE264_SRC)/tests/conformance/2d/FREXT3_TANDBERG_A.264
+BITEXACT_FRAME_422 ?= 3
 check-bitexact: coretest
 ifndef TEST_FILE
 	@echo "set TEST_FILE=<file.264> to run the bit-exact check, e.g. make check-bitexact TEST_FILE=movie.264"
@@ -302,6 +310,15 @@ endif
 	  a=$$(md5sum < "$$core"); b=$$(md5sum < "$$ref"); \
 	  echo "core=$$a"; echo "ref =$$b"; \
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264: OK" || { echo "MISMATCH"; exit 1; }
+	@set -e; \
+	  if [ ! -f "$(TEST_422)" ]; then echo "($(TEST_422) missing: skipping the 4:2:2 bit-exact check)"; exit 0; fi; \
+	  core=$$(mktemp); ref=$$(mktemp); \
+	  trap 'rm -f "$$core" "$$ref"' EXIT; \
+	  ./coretest "$(TEST_422)" 0 $(BITEXACT_FRAME_422) "$$core"; \
+	  sh tests/mkref.sh "$(EDGE264_SRC)/edge264mvc_test" "$(TEST_422)" $(BITEXACT_FRAME_422) "$$ref" yuv422p; \
+	  a=$$(md5sum < "$$core"); b=$$(md5sum < "$$ref"); \
+	  echo "core 4:2:2=$$a"; echo "ref  4:2:2=$$b"; \
+	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264 (4:2:2): OK" || { echo "MISMATCH (4:2:2)"; exit 1; }
 
 # Full end-to-end AviSynth+ check: load the built plugin through a real AviSynth+
 # runtime (properties, layouts, error paths), then bit-exact vs an edge264
@@ -314,6 +331,10 @@ ifndef TEST_FILE
 endif
 	@echo "== AviSynth+ end-to-end (real runtime: properties, layouts, error paths) =="
 	./avshost ./$(AVS_PLUGIN) "$(TEST_FILE)" tab
+	@if [ -f "$(TEST_422)" ]; then \
+	    echo "== AviSynth+ with a 4:2:2 stream (declared as YV16) =="; \
+	    AVSHOST_CHROMA=422 ./avshost ./$(AVS_PLUGIN) "$(TEST_422)" base; \
+	fi
 	@echo "== bit-exact vs edge264 through AviSynth+ =="
 	$(MAKE) -C $(EDGE264_SRC) STATIC=yes BUILDTEST=no edge264mvc_test
 	@set -e; \

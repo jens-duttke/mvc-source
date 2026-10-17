@@ -46,6 +46,7 @@ typedef struct {
 	int64_t fps_den;
 	int num_frames;    /* number of output frames: base pictures, or 2x that for MVC_ALT */
 	int is_mvc;        /* stream actually carries a dependent view */
+	int chroma_422;    /* chroma planes of full height (4:2:2), else half height (4:2:0) */
 	MvcLayout layout;  /* effective layout (tab/sbs/alt downgraded to base on 2D) */
 } MvcInfo;
 

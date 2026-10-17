@@ -143,7 +143,10 @@ int main(int argc, char **argv) {
 		vi->width, vi->height, vi->num_frames, vi->fps_numerator, vi->fps_denominator,
 		(unsigned)vi->pixel_type, avs_is_yv12(vi));
 	if (vi->width <= 0 || vi->height <= 0 || vi->num_frames <= 0) { printf("FAIL: bad vi\n"); fail = 1; }
-	if (!avs_is_yv12(vi)) { printf("FAIL: format is not YV12\n"); fail = 1; }
+	/* YV12, or YV16 for a 4:2:2 stream (AVSHOST_CHROMA=422) */
+	const char *chroma = getenv("AVSHOST_CHROMA");
+	int want_422 = chroma && !strcmp(chroma, "422");
+	if (want_422 ? !avs_is_yv16(vi) : !avs_is_yv12(vi)) { printf("FAIL: format is not %s\n", want_422 ? "YV16" : "YV12"); fail = 1; }
 
 	/* 3. pull a handful of frames (front and a middle one) */
 	int probe[] = { 0, 1, 2, vi->num_frames / 2, vi->num_frames - 1 };

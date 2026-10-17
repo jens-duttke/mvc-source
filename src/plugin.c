@@ -167,7 +167,7 @@ static void VS_CC vs_source_create(const VSMap *in, VSMap *out, void *userData,
 	FilterData *d = calloc(1, sizeof *d);
 	if (!d) { mvc_close(src); vsapi->mapSetError(out, "mvc.Source: out of memory"); return; }
 	d->src = src;
-	vsapi->getVideoFormatByID(&d->vi.format, pfYUV420P8, core);
+	vsapi->getVideoFormatByID(&d->vi.format, info->chroma_422 ? pfYUV422P8 : pfYUV420P8, core);
 	d->vi.width = info->width;
 	d->vi.height = info->height;
 	d->vi.numFrames = info->num_frames;

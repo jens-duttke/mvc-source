@@ -1172,6 +1172,12 @@ static void assemble_plane(const MvcSource *s, const Picture *f, int plane,
 	int chroma = plane > 0;
 	int w = chroma ? f->width_C : f->width_Y;
 	int h = chroma ? f->height_C : f->height_Y;
+	/* never more than the format declared to the host from the first picture,
+	 * which a later picture of another size or chroma format would overrun */
+	int dw = chroma ? s->info.base_width >> 1 : s->info.base_width;
+	int dh = chroma && !s->info.chroma_422 ? s->info.base_height >> 1 : s->info.base_height;
+	if (w > dw) w = dw;
+	if (h > dh) h = dh;
 	ptrdiff_t sstride = chroma ? f->stride_C : f->stride_Y;
 	const uint8_t *base = f->samples[plane];
 	/* a frame may miss its dependent view (lone base at a gap): reuse base */
@@ -1628,6 +1634,9 @@ MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
 	ring_store(s, 0, &f);
 	s->info.base_width = f.width_Y;
 	s->info.base_height = f.height_Y;
+	/* edge264-mvc outputs 4:2:0 (monochrome included) or, since v2026.10.17,
+	 * 4:2:2, whose chroma planes have the height of luma */
+	s->info.chroma_422 = f.height_C == f.height_Y;
 	switch (s->info.layout) {
 	case MVC_TAB: s->info.width = f.width_Y; s->info.height = f.height_Y * 2; break;
 	case MVC_SBS: s->info.width = f.width_Y * 2; s->info.height = f.height_Y; break;

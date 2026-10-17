@@ -182,7 +182,7 @@ static AVS_Value AVSC_CC Create_MVCSource(AVS_ScriptEnvironment *env, AVS_Value 
 	fi->vi.width = info->width;
 	fi->vi.height = info->height;
 	fi->vi.num_frames = info->num_frames;
-	fi->vi.pixel_type = AVS_CS_YV12; /* YUV420P8, matching the core's output */
+	fi->vi.pixel_type = info->chroma_422 ? AVS_CS_YV16 : AVS_CS_YV12; /* YUV422P8 or YUV420P8, matching the core's output */
 	fi->vi.fps_numerator = (unsigned)info->fps_num;
 	fi->vi.fps_denominator = (unsigned)info->fps_den;
 	fi->vi.audio_samples_per_second = 0; /* no audio */

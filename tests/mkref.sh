@@ -1,9 +1,10 @@
 #!/bin/sh
-# Extract one frame of edge264-mvc's own decode as raw planar YUV420P, for the
+# Extract one frame of edge264-mvc's own decode as raw planar YUV (420P unless a
+# pixel format is given, yuv422p for a 4:2:2 stream), for the
 # bit-exact cross-check. Shared by the Makefile's check-bitexact target and the
 # CI bit-exact step so the reference-generation lives in exactly one place.
 #
-# usage: sh tests/mkref.sh <edge264mvc_test> <file.264> <frame> <out.yuv>
+# usage: sh tests/mkref.sh <edge264mvc_test> <file.264> <frame> <out.yuv> [pix_fmt]
 #
 # Note: edge264mvc_test is killed by SIGPIPE (exit 141) by design once ffmpeg has
 # taken its single frame - that is expected. Do NOT add `set -o pipefail` here:
@@ -15,7 +16,8 @@ E264="$1"
 FILE="$2"
 FRAME="$3"
 OUT="$4"
+PIXFMT="${5:-yuv420p}"
 
 "$E264" "$FILE" -oks 2>/dev/null | \
     ffmpeg -loglevel error -i - -vf "select=eq(n\,$FRAME)" -frames:v 1 \
-    -f rawvideo -pix_fmt yuv420p "$OUT" -y
+    -f rawvideo -pix_fmt "$PIXFMT" "$OUT" -y
