@@ -93,6 +93,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # actions/checkout leaves the pushed tag as a plain ref to its commit,
+          # whose message --notes-from-tag then takes instead of the annotation
+          # (v0.14.0 and v0.15.0 had to be repaired by hand); fetch it again
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
           files="libvsmvc.so libavsmvc.so libvsmvc.dll libavsmvc.dll"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" $files --clobber
