@@ -170,18 +170,18 @@ jobs:
           # edge264mvc_test built above (same object/.a names per OS).
           cp -r ../edge264 ../edge264-win
           make -C ../edge264-win clean
-          make -C ../edge264-win OS=windows CC=x86_64-w64-mingw32-gcc STATIC=yes BUILDTEST=no
+          make -C ../edge264-win OS=windows CC=x86_64-w64-mingw32-gcc CFLAGS=-march=x86-64 VARIANTS=x86-64-v2,x86-64-v3 STATIC=yes BUILDTEST=no
       - name: Cross-build both plugin DLLs and verify their exports
         run: |
           make libavsmvc.dll CC=x86_64-w64-mingw32-gcc DLLTOOL=x86_64-w64-mingw32-dlltool \
-            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc CFLAGS=-march=x86-64 VARIANTS=x86-64-v2,x86-64-v3"
           file libavsmvc.dll
           x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -A2 "Ordinal/Name Pointer"
           # exactly avisynth_c_plugin_init is exported and no edge264 symbol leaks
           x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -q "] avisynth_c_plugin_init"
           test "$(x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -c -i edge264)" = "0"
           make libvsmvc.dll CC=x86_64-w64-mingw32-gcc DLLTOOL=x86_64-w64-mingw32-dlltool \
-            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc CFLAGS=-march=x86-64 VARIANTS=x86-64-v2,x86-64-v3"
           file libvsmvc.dll
           # exactly VapourSynthPluginInit2 is exported and no edge264 symbol leaks
           x86_64-w64-mingw32-objdump -p libvsmvc.dll | grep -q "VapourSynthPluginInit2"
@@ -189,7 +189,7 @@ jobs:
       - name: Windows core bit-exact via Wine (proves the Win32 I/O shim)
         run: |
           make coretest.exe CC=x86_64-w64-mingw32-gcc \
-            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+            EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc CFLAGS=-march=x86-64 VARIANTS=x86-64-v2,x86-64-v3"
           export WINEDEBUG=-all
           # a relative path in the CWD (Wine maps the working dir to a drive letter),
           # the path form validated locally via the WSL Windows-interop run.

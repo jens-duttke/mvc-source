@@ -85,7 +85,7 @@ $(AVS_PLUGIN): src/avisynth_plugin.c src/mvcsource.c src/mvcsource.h $(EDGE264_A
 # toolchain and a Windows edge264 build, e.g.:
 #   make libavsmvc.dll CC=x86_64-w64-mingw32-gcc DLLTOOL=x86_64-w64-mingw32-dlltool \
 #        EDGE264_SRC=/path/to/edge264-win \
-#        EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+#        EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc CFLAGS=-march=x86-64 VARIANTS=x86-64-v2,x86-64-v3"
 # The C interface is used precisely so this MinGW-built .dll loads in the official
 # MSVC-built AviSynth+ (the C++ vtable ABI does not match across GCC/MSVC). The
 # import library for AviSynth's C API is generated from a .def with dlltool, so no

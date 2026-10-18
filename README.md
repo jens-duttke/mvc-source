@@ -97,14 +97,15 @@ A local build targets the build machine (`-march=native`). To build the portable
 The Windows DLLs are cross-compiled on Linux with MinGW-w64 (`gcc-mingw-w64-x86-64`). The AviSynth+ plugin uses the AviSynth C interface, so the MinGW-built DLL loads in the official MSVC-built AviSynth+.
 
 ```sh
-# edge264-mvc for Windows, in a separate tree
+# edge264-mvc for Windows, in a separate tree, with the SSE4 and AVX2 code it
+# selects at run time on the CPUs that have them
 cp -r ../edge264 ../edge264-win && make -C ../edge264-win clean
-make -C ../edge264-win OS=windows CC=x86_64-w64-mingw32-gcc STATIC=yes BUILDTEST=no
+make -C ../edge264-win OS=windows CC=x86_64-w64-mingw32-gcc CFLAGS=-march=x86-64 VARIANTS=x86-64-v2,x86-64-v3 STATIC=yes BUILDTEST=no
 
 # the plugins
 make libavsmvc.dll libvsmvc.dll CC=x86_64-w64-mingw32-gcc \
     DLLTOOL=x86_64-w64-mingw32-dlltool \
-    EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc"
+    EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc CFLAGS=-march=x86-64 VARIANTS=x86-64-v2,x86-64-v3"
 ```
 
 ## Tests
