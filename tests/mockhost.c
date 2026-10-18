@@ -140,7 +140,7 @@ static VSFrame *VS_CC mock_newVideoFrame(const VSVideoFormat *fmt, int w, int h,
 	for (int p = 0; p < fmt->numPlanes; p++) {
 		int pw = p ? w >> fmt->subSamplingW : w;
 		int ph = p ? h >> fmt->subSamplingH : h;
-		f->stride[p] = stride_for(pw);
+		f->stride[p] = stride_for(pw * fmt->bytesPerSample); /* in bytes, as VapourSynth's */
 		f->plane[p] = malloc((size_t)f->stride[p] * ph);
 	}
 	return f;
@@ -599,12 +599,15 @@ int main(int argc, char **argv) {
 		vi->format.colorFamily, vi->format.bitsPerSample, vi->format.subSamplingW,
 		vi->format.subSamplingH, vi->format.numPlanes);
 	if (vi->width <= 0 || vi->height <= 0 || vi->numFrames <= 0) { printf("FAIL: bad vi\n"); fail = 1; }
-	/* YUV420P8, or YUV422P8 for a 4:2:2 stream (MOCKHOST_CHROMA=422) */
+	/* YUV420P8, or YUV422P8 for a 4:2:2 stream (MOCKHOST_CHROMA=422), at the
+	 * bits of MOCKHOST_BITS (8 by default) */
 	const char *chroma = getenv("MOCKHOST_CHROMA");
 	int want_422 = chroma && !strcmp(chroma, "422");
-	if (vi->format.colorFamily != cfYUV || vi->format.bitsPerSample != 8 ||
+	const char *bits_env = getenv("MOCKHOST_BITS");
+	int want_bits = bits_env ? atoi(bits_env) : 8;
+	if (vi->format.colorFamily != cfYUV || vi->format.bitsPerSample != want_bits ||
 	    vi->format.subSamplingW != 1 || vi->format.subSamplingH != (want_422 ? 0 : 1)) {
-		printf("FAIL: format is not %s\n", want_422 ? "YUV422P8" : "YUV420P8"); fail = 1;
+		printf("FAIL: format is not %s at %d bits\n", want_422 ? "YUV422P" : "YUV420P", want_bits); fail = 1;
 	}
 
 	/* fps pairing semantics (M1) */
@@ -650,7 +653,7 @@ int main(int argc, char **argv) {
 				int ph = p ? vi->height >> vi->format.subSamplingH : vi->height;
 				const uint8_t *pl = mock_getReadPtr(fr, p);
 				ptrdiff_t st = mock_getStride(fr, p);
-				for (int y = 0; y < ph; y++) fwrite(pl + (ptrdiff_t)y * st, 1, (size_t)pw, f);
+				for (int y = 0; y < ph; y++) fwrite(pl + (ptrdiff_t)y * st, 1, (size_t)pw * vi->format.bytesPerSample, f);
 			}
 			fclose(f);
 			mock_freeFrame(fr);

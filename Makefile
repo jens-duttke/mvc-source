@@ -270,6 +270,13 @@ check: coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfail
 	    ./coretest "$(TEST_422)" 0 && \
 	    MOCKHOST_CHROMA=422 ASAN_OPTIONS=detect_leaks=1 ./mockhost-asan ./$(PLUGIN) "$(TEST_422)" base; \
 	else echo "  ($(TEST_422) missing: edge264-mvc older than v2026.10.17, which decodes no 4:2:2; skipping)"; fi
+	@echo "== 9- and 10-bit streams (edge264-mvc fixtures): declared at their bits, frames fill them exactly =="
+	@if [ -f "$(TEST_10BIT)" ]; then \
+	    ./coretest "$(TEST_10BIT)" 0 && ./coretest "$(TEST_10BIT_422)" 0 && ./coretest "$(TEST_9BIT)" 0 && \
+	    MOCKHOST_BITS=10 ASAN_OPTIONS=detect_leaks=1 ./mockhost-asan ./$(PLUGIN) "$(TEST_10BIT)" base && \
+	    MOCKHOST_CHROMA=422 MOCKHOST_BITS=10 ASAN_OPTIONS=detect_leaks=1 ./mockhost-asan ./$(PLUGIN) "$(TEST_10BIT_422)" base && \
+	    MOCKHOST_BITS=9 ASAN_OPTIONS=detect_leaks=1 ./mockhost-asan ./$(PLUGIN) "$(TEST_9BIT)" base; \
+	else echo "  ($(TEST_10BIT) missing: edge264-mvc older than v2026.10.18, which decodes no 9 or 10 bits; skipping)"; fi
 	@echo "== field pictures (edge264-mvc fixtures): one frame per field pair, seeks match a sequential read =="
 	@if [ -f "$(TEST_PAFF)" ]; then \
 	    for f in $(TEST_PAFF) $(TEST_PAFF_MIXED); do ./coretest "$$f" 0 || exit 1; done && \
@@ -301,9 +308,14 @@ BITEXACT_FRAME ?= 5
 # a 4:2:2 stream that edge264-mvc v2026.10.17 and later carries as a fixture (5 frames)
 TEST_422 ?= $(EDGE264_SRC)/tests/conformance/2d/FREXT3_TANDBERG_A.264
 BITEXACT_FRAME_422 ?= 3
-# streams of field pictures that edge264-mvc v2026.10.18 and later carries as
-# fixtures: fields only, frames mixed with fields (CABAC and CAVLC), and fields
-# of which some lack their pair
+# streams of 9 and 10 bits and of field pictures that edge264-mvc v2026.10.18 and
+# later carries as fixtures: 10-bit 4:2:0 with B frames (30 frames), 10-bit
+# 4:2:2 and 9-bit 4:2:0; fields only, frames mixed with fields (CABAC and
+# CAVLC), and fields of which some lack their pair
+TEST_10BIT ?= $(EDGE264_SRC)/tests/conformance/2d-synthetic/hbd_b_weighted.264
+TEST_10BIT_422 ?= $(EDGE264_SRC)/tests/conformance/2d-synthetic/hbd_422_cavlc.264
+TEST_9BIT ?= $(EDGE264_SRC)/tests/conformance/2d-synthetic/hbd_9bit.264
+BITEXACT_FRAME_10BIT ?= 7
 TEST_PAFF ?= $(EDGE264_SRC)/tests/conformance/2d/CVFI1_SVA_C.264
 TEST_PAFF_MIXED ?= $(EDGE264_SRC)/tests/conformance/2d/HCAFF1_HHI_B.264 $(EDGE264_SRC)/tests/conformance/2d/Sharp_MP_PAFF_1r2.264 $(EDGE264_SRC)/tests/conformance/2d-synthetic/unpaired_fields.264
 BITEXACT_FRAME_PAFF ?= 4
@@ -331,10 +343,11 @@ endif
 	  echo "core 4:2:2=$$a"; echo "ref  4:2:2=$$b"; \
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264 (4:2:2): OK" || { echo "MISMATCH (4:2:2)"; exit 1; }
 	@set -e; \
-	  if [ ! -f "$(TEST_PAFF)" ]; then echo "($(TEST_PAFF) missing: skipping the field picture bit-exact checks)"; exit 0; fi; \
+	  if [ ! -f "$(TEST_10BIT)" ]; then echo "($(TEST_10BIT) missing: skipping the 10-bit and field picture bit-exact checks)"; exit 0; fi; \
 	  core=$$(mktemp); ref=$$(mktemp); \
 	  trap 'rm -f "$$core" "$$ref"' EXIT; \
-	  for t in "$(TEST_PAFF) $(BITEXACT_FRAME_PAFF) yuv420p" "$(firstword $(TEST_PAFF_MIXED)) $(BITEXACT_FRAME_PAFF) yuv420p"; do \
+	  for t in "$(TEST_10BIT) $(BITEXACT_FRAME_10BIT) yuv420p10le" "$(TEST_10BIT_422) $(BITEXACT_FRAME_10BIT) yuv422p10le" \
+	           "$(TEST_PAFF) $(BITEXACT_FRAME_PAFF) yuv420p" "$(firstword $(TEST_PAFF_MIXED)) $(BITEXACT_FRAME_PAFF) yuv420p"; do \
 	    set -- $$t; \
 	    ./coretest "$$1" 0 $$2 "$$core"; \
 	    sh tests/mkref.sh "$(EDGE264_SRC)/edge264mvc_test" "$$1" $$2 "$$ref" $$3; \

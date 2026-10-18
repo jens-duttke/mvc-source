@@ -172,6 +172,11 @@ static AVS_Value AVSC_CC Create_MVCSource(AVS_ScriptEnvironment *env, AVS_Value 
 
 	/* Source filter: no child clip, so store_child = 0 and every callback is
 	 * defined (AviSynth would otherwise forward undefined ones to the child). */
+	/* AviSynth+ has 8-, 10-, 12-, 14- and 16-bit formats, but none of 9 bits */
+	if (info->bit_depth == 9) {
+		mvc_close(src);
+		return avs_new_value_error("MVCSource: 9-bit video is not supported by AviSynth+");
+	}
 	AVS_FilterInfo *fi = NULL;
 	AVS_Clip *clip = avs_new_c_filter(env, &fi, avs_void, 0);
 	if (!clip) {
@@ -182,7 +187,9 @@ static AVS_Value AVSC_CC Create_MVCSource(AVS_ScriptEnvironment *env, AVS_Value 
 	fi->vi.width = info->width;
 	fi->vi.height = info->height;
 	fi->vi.num_frames = info->num_frames;
-	fi->vi.pixel_type = info->chroma_422 ? AVS_CS_YV16 : AVS_CS_YV12; /* YUV422P8 or YUV420P8, matching the core's output */
+	/* YUV420P8 to YUV422P10, matching the core's output */
+	fi->vi.pixel_type = info->bit_depth > 8 ? (info->chroma_422 ? AVS_CS_YUV422P10 : AVS_CS_YUV420P10) :
+		info->chroma_422 ? AVS_CS_YV16 : AVS_CS_YV12;
 	fi->vi.fps_numerator = (unsigned)info->fps_num;
 	fi->vi.fps_denominator = (unsigned)info->fps_den;
 	fi->vi.audio_samples_per_second = 0; /* no audio */

@@ -167,7 +167,11 @@ static void VS_CC vs_source_create(const VSMap *in, VSMap *out, void *userData,
 	FilterData *d = calloc(1, sizeof *d);
 	if (!d) { mvc_close(src); vsapi->mapSetError(out, "mvc.Source: out of memory"); return; }
 	d->src = src;
-	vsapi->getVideoFormatByID(&d->vi.format, info->chroma_422 ? pfYUV422P8 : pfYUV420P8, core);
+	/* YUV420P8 to YUV422P10: 4:2:0 or 4:2:2, at the stream's 8 to 10 bits, the
+	 * id composed as VapourSynth4.h's VS_MAKE_VIDEO_ID (which it undefines) */
+	uint32_t format_id = (uint32_t)cfYUV << 28 | (uint32_t)stInteger << 24 | (uint32_t)info->bit_depth << 16 |
+		1u << 8 | (info->chroma_422 ? 0u : 1u);
+	vsapi->getVideoFormatByID(&d->vi.format, format_id, core);
 	d->vi.width = info->width;
 	d->vi.height = info->height;
 	d->vi.numFrames = info->num_frames;

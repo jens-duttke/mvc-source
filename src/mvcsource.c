@@ -77,8 +77,10 @@ typedef struct { const uint8_t *nal, *end; int type, id; int nal_i; } ParamNal;
 typedef struct {
 	const uint8_t *samples[3];
 	const uint8_t *samples_mvc[3];
-	int width_Y, width_C, height_Y, height_C;
-	int stride_Y, stride_C;
+	int width_Y, width_C, height_Y, height_C; /* in samples */
+	int stride_Y, stride_C;                   /* in bytes */
+	int depth_Y, depth_C;                     /* bits per sample */
+	int bps_Y, bps_C;                         /* bytes per sample: 2 above 8 bits */
 	int64_t DisplayPoc;
 } Picture;
 
@@ -93,6 +95,10 @@ static void picture_from(Picture *p, const Edge264MvcFrame *f) {
 	p->height_C = f->height_C;
 	p->stride_Y = f->stride_Y;
 	p->stride_C = f->stride_C;
+	p->depth_Y = f->bit_depth_Y;
+	p->depth_C = f->bit_depth_C;
+	p->bps_Y = f->bit_depth_Y > 8 ? 2 : 1;
+	p->bps_C = f->bit_depth_C > 8 ? 2 : 1;
 	p->DisplayPoc = f->views[0].display_order;
 }
 
@@ -1101,7 +1107,7 @@ static void copy_plane(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
 /* Bytes to cache one source picture: base Y/U/V plus, for MVC, the dependent
  * view's Y/U/V, all stored packed (stride == width). */
 static size_t slot_bytes(const Picture *f) {
-	size_t one = (size_t)f->width_Y * f->height_Y + 2 * (size_t)f->width_C * f->height_C;
+	size_t one = (size_t)f->width_Y * f->bps_Y * f->height_Y + 2 * (size_t)f->width_C * f->bps_C * f->height_C;
 	return f->samples_mvc[0] ? 2 * one : one;
 }
 
@@ -1143,7 +1149,8 @@ static FrameSlot *ring_store(MvcSource *s, int index, const Picture *f) {
 		sl->buf = nb;
 		sl->bufcap = need;
 	}
-	int w = f->width_Y, h = f->height_Y, cw = f->width_C, ch = f->height_C;
+	/* rows in bytes, packed */
+	int w = f->width_Y * f->bps_Y, h = f->height_Y, cw = f->width_C * f->bps_C, ch = f->height_C;
 	size_t ysz = (size_t)w * h, csz = (size_t)cw * ch;
 	uint8_t *d = sl->buf;
 	copy_plane(d, w, f->samples[0], f->stride_Y, w, h);
@@ -1184,11 +1191,13 @@ static void ring_free(MvcSource *s) {
 static void assemble_plane(const MvcSource *s, const Picture *f, int plane,
 	MvcLayout layout, uint8_t *dst, ptrdiff_t dstride) {
 	int chroma = plane > 0;
-	int w = chroma ? f->width_C : f->width_Y;
+	/* rows in bytes, 2 per sample above 8 bits */
+	int w = chroma ? f->width_C * f->bps_C : f->width_Y * f->bps_Y;
 	int h = chroma ? f->height_C : f->height_Y;
 	/* never more than the format declared to the host from the first picture,
-	 * which a later picture of another size or chroma format would overrun */
-	int dw = chroma ? s->info.base_width >> 1 : s->info.base_width;
+	 * which a later picture of another size, chroma format or bit depth would
+	 * overrun */
+	int dw = (chroma ? s->info.base_width >> 1 : s->info.base_width) * (s->info.bit_depth > 8 ? 2 : 1);
 	int dh = chroma && !s->info.chroma_422 ? s->info.base_height >> 1 : s->info.base_height;
 	if (w > dw) w = dw;
 	if (h > dh) h = dh;
@@ -1663,6 +1672,14 @@ MvcSource *mvc_open2(const char *base_path, const char *dep_path, int n_threads,
 	/* edge264-mvc outputs 4:2:0 (monochrome included) or, since v2026.10.17,
 	 * 4:2:2, whose chroma planes have the height of luma */
 	s->info.chroma_422 = f.height_C == f.height_Y;
+	/* edge264-mvc outputs 9 and 10 bits since v2026.10.18, in 16-bit words; the
+	 * hosts have no format with chroma of another depth than luma */
+	s->info.bit_depth = f.depth_Y == f.depth_C ? f.depth_Y : 0;
+	if (s->info.bit_depth == 0) {
+		set_err(err, errsize, "luma and chroma of different bit depths are not supported");
+		mvc_close(s);
+		return NULL;
+	}
 	switch (s->info.layout) {
 	case MVC_TAB: s->info.width = f.width_Y; s->info.height = f.height_Y * 2; break;
 	case MVC_SBS: s->info.width = f.width_Y * 2; s->info.height = f.height_Y; break;

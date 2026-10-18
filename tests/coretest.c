@@ -41,7 +41,9 @@ int main(int argc, char **argv) {
 	/* dump mode: coretest <file> <layout> <frame> <out.yuv> -> raw planar YUV */
 	if (argc >= 5) {
 		int fn = atoi(argv[3]);
-		int W = in->width, H = in->height, CW = W / 2, CH = in->chroma_422 ? H : H / 2;
+		/* row widths in bytes, 2 per sample above 8 bits */
+		int B = in->bit_depth > 8 ? 2 : 1;
+		int W = in->width * B, H = in->height, CW = in->width / 2 * B, CH = in->chroma_422 ? H : H / 2;
 		uint8_t *Y = malloc((size_t)W * H), *U = malloc((size_t)CW * CH), *V = malloc((size_t)CW * CH);
 		if (!Y || !U || !V) { fprintf(stderr, "oom\n"); return 1; }
 		if (mvc_get_frame(s, fn, Y, W, U, CW, V, CW, err, sizeof err)) {
@@ -59,12 +61,14 @@ int main(int argc, char **argv) {
 		mvc_close(s); free(Y); free(U); free(V);
 		return 0;
 	}
-	printf("info: %dx%d  base=%dx%d  fps=%lld/%lld  frames=%d  mvc=%d  layout=%d  chroma=%s\n",
+	printf("info: %dx%d  base=%dx%d  fps=%lld/%lld  frames=%d  mvc=%d  layout=%d  chroma=%s  bits=%d\n",
 		in->width, in->height, in->base_width, in->base_height,
 		(long long)in->fps_num, (long long)in->fps_den, in->num_frames, in->is_mvc, in->layout,
-		in->chroma_422 ? "4:2:2" : "4:2:0");
+		in->chroma_422 ? "4:2:2" : "4:2:0", in->bit_depth);
 
-	int W = in->width, H = in->height, CW = W / 2, CH = in->chroma_422 ? H : H / 2;
+	/* row widths in bytes, 2 per sample above 8 bits */
+	int B = in->bit_depth > 8 ? 2 : 1;
+	int W = in->width * B, H = in->height, CW = in->width / 2 * B, CH = in->chroma_422 ? H : H / 2;
 	uint8_t *Y = malloc((size_t)W * H), *U = malloc((size_t)CW * CH), *V = malloc((size_t)CW * CH);
 	if (!Y || !U || !V) { fprintf(stderr, "oom\n"); return 1; }
 
