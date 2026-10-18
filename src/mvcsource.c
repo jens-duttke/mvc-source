@@ -272,7 +272,7 @@ static void unmap_file(uint8_t *p, size_t size) {
  * Machine-local artifact: written and read by the same build, so native field
  * sizes/order are fine (the magic gates any future format change).
  */
-#define MVCIDX_MAGIC "MVCIDX06" /* bump the trailing digits to invalidate old caches (05: parameter sets now carry their type + id, so a seek re-feeds only the active ones; 06: the leading pictures of a non-IDR first picture are not counted) */
+#define MVCIDX_MAGIC "MVCIDX07" /* bump the trailing digits to invalidate old caches (05: parameter sets now carry their type + id, so a seek re-feeds only the active ones; 06: the leading pictures of a non-IDR first picture are not counted; 07: the two fields of a frame count as one frame) */
 
 struct idx_hdr {
 	char     magic[8];   /* MVCIDX_MAGIC, no NUL */
@@ -425,7 +425,7 @@ static void save_index_cache(const MvcSource *s, const char *cpath, uint64_t src
  * the pairing and is never opened single-file, so it cannot collide with a
  * single-file `<base>.mvcidx`.
  */
-#define MVCIDX2_MAGIC "MVC2FI04" /* bump the trailing digits to invalidate old two-file caches (02: seek points include open-GOP recovery points; 03: leading orphan dependent AUs are emitted ahead of the first base AU - an older sidecar of an orphan-headed pair caches the mispaired order; 04: the leading pictures of a non-IDR first picture are not counted) */
+#define MVCIDX2_MAGIC "MVC2FI05" /* bump the trailing digits to invalidate old two-file caches (02: seek points include open-GOP recovery points; 03: leading orphan dependent AUs are emitted ahead of the first base AU - an older sidecar of an orphan-headed pair caches the mispaired order; 04: the leading pictures of a non-IDR first picture are not counted; 05: the two fields of a frame count as one frame) */
 
 struct idx_hdr2 {
 	char     magic[8];    /* MVCIDX2_MAGIC, no NUL */
@@ -726,15 +726,16 @@ static int scan_index_pass(MvcSource *s, int use_poc) {
 	int recovery_seen = 0;              /* a recovery_point SEI is pending for the next picture */
 	int cvs_base = 0, cvs_first_sp = 0; /* start of the coded video sequence being scanned */
 	StartLeading lead = {0};
+	H264FieldPair fp = {0};             /* a first field whose frame the next picture may complete */
+	int last_pushed = 0;                /* the last counted picture's POC is in pb */
 	int rc = 0;
 	PocBuf pb = {0};
-	H264PocCtx *pc = NULL;
-	if (use_poc) {
-		pc = malloc(sizeof *pc); /* ~35 KB: too big for a frameserver worker's stack */
-		if (!pc)
-			return -1;
-		h264_poc_ctx_init(pc);
-	}
+	/* The parameter sets are read in both passes, since telling a second field
+	 * from a frame takes the slice header up to its field flags. */
+	H264PocCtx *pc = malloc(sizeof *pc); /* ~35 KB: too big for a frameserver worker's stack */
+	if (!pc)
+		return -1;
+	h264_poc_ctx_init(pc);
 	/* Progress in whole-file byte positions (total == file size), matching the
 	 * two-file scan's metric; the few leading start-code bytes before s->start
 	 * merely make the first tick report 0% instead of starting past it. */
@@ -754,17 +755,17 @@ static int scan_index_pass(MvcSource *s, int use_poc) {
 			seen_pps = 1;
 		if (type == 7 || type == 8 || type == 13 || type == 15) /* SPS/PPS/SPS-ext/subset-SPS */
 			ps_push(s, p, nend, type, h264_param_set_id(p, nend, type));
-		if (use_poc) {
-			/* Only the base SPS (7) feeds the POC parser, never the MVC subset SPS
-			 * (15): they share the id numbering but are distinct sets, so a subset
-			 * SPS would overwrite the base view's (see h264poc.h). */
-			if (type == 7)
-				h264_parse_sps(pc, p, nend);
-			else if (type == 8)
-				h264_parse_pps(pc, p, nend);
-			else if (type == 6 && h264_sei_is_recovery_point(p, nend))
-				recovery_seen = 1;
-		}
+		/* Only the base SPS (7) feeds the POC parser, never the MVC subset SPS
+		 * (15): they share the id numbering but are distinct sets, so a subset
+		 * SPS would overwrite the base view's (see h264poc.h). */
+		if (type == 7)
+			h264_parse_sps(pc, p, nend);
+		else if (type == 8)
+			h264_parse_pps(pc, p, nend);
+		else if (use_poc && type == 6 && h264_sei_is_recovery_point(p, nend))
+			recovery_seen = 1;
+		if (type == 10)
+			fp.pending = 0; /* end of sequence: the decoder pairs no field across it */
 		if ((type == 1 || type == 5) && (p + 1 < end) && (p[1] & 0x80) && seen_sps && seen_pps) { /* base primary picture */
 			/* If this AU begins directly with its VCL NAL (no leading non-VCL
 			 * NAL advanced au_start), the first slice itself is the AU start.
@@ -772,10 +773,22 @@ static int scan_index_pass(MvcSource *s, int use_poc) {
 			 * every later seek point records the wrong byte offset. */
 			if (in_vcl)
 				au_start = p;
+			H264PicInfo pi;
+			int parsed = h264_parse_picture(pc, p, nend, &pi);
+			if (use_poc && !parsed) { rc = -1; goto out; }
+			if (h264_second_field(&fp, &pi)) {
+				/* the second field of the frame counted last: no frame of its own,
+				 * and the frame's order count is the lower of its fields' */
+				if (last_pushed && pi.poc < pb.v[pb.n - 1])
+					pb.v[pb.n - 1] = pi.poc;
+				in_vcl = 1;
+				recovery_seen = 0;
+				p = (sc < end) ? sc + 3 : end;
+				continue;
+			}
 			int leading = 0; /* left out by the decoder (see StartLeading) */
+			last_pushed = 0;
 			if (use_poc) {
-				H264PicInfo pi;
-				if (!h264_parse_picture(pc, p, nend, &pi)) { rc = -1; goto out; }
 				leading = is_start_leading(&lead, &pi);
 				if (pi.is_idr) { /* an IDR ends the previous sequence and starts a new one */
 					if (flush_cvs(s, &pb, cvs_base, cvs_first_sp) < 0) { rc = -1; goto out; }
@@ -785,6 +798,7 @@ static int scan_index_pass(MvcSource *s, int use_poc) {
 					h264_poc_reset(pc);
 				}
 				if (!leading && pocbuf_push(&pb, pi.poc) < 0) { rc = -1; goto out; }
+				last_pushed = !leading;
 				/* Every random-access point becomes a seek point: an IDR, or an
 				 * I picture preceded by a recovery_point SEI (an exact open-GOP
 				 * entry point, which is what a 3D Blu-ray puts between its far
@@ -1319,13 +1333,13 @@ static int collect_view_nals(MvcSource *s, const uint8_t *map, size_t map_size, 
  */
 static int build_interleaved_pass(MvcSource *s, int use_poc, char *err, size_t errsize) {
 	PocBuf pb = {0};
-	H264PocCtx *pc = NULL;
-	if (use_poc) {
-		pc = malloc(sizeof *pc); /* ~35 KB: too big for a frameserver worker's stack */
-		if (!pc)
-			return 1; /* treat like a defeated derivation: IDR-only is still correct */
-		h264_poc_ctx_init(pc);
+	/* read in both passes, as in scan_index_pass, to pair the fields of a frame */
+	H264PocCtx *pc = malloc(sizeof *pc); /* ~35 KB: too big for a frameserver worker's stack */
+	if (!pc) {
+		set_err(err, errsize, "out of memory");
+		return -1;
 	}
+	h264_poc_ctx_init(pc);
 	ViewNal *bn = NULL, *dn = NULL;
 	int nb = 0, nd = 0, nab = 0, nad = 0;
 	/* The two walks below touch every byte of both files (start-code scanning) and
@@ -1388,6 +1402,8 @@ static int build_interleaved_pass(MvcSource *s, int use_poc, char *err, size_t e
 	int recovery_seen = 0;              /* a recovery_point SEI is pending for the next picture */
 	int cvs_base = 0, cvs_first_sp = 0; /* start of the coded video sequence being scanned */
 	StartLeading lead = {0};
+	H264FieldPair fp = {0};             /* a first field whose frame the next picture may complete */
+	int last_pushed = 0;                /* the last counted picture's POC is in pb */
 	int rc = 0;
 	/* leading orphan dependent AUs, ahead of the first base AU (see above) */
 	for (; di < nd && dn[di].au < dep_shift; di++, si++) {
@@ -1415,20 +1431,29 @@ static int build_interleaved_pass(MvcSource *s, int use_poc, char *err, size_t e
 				if (s->nps > before) s->ps[s->nps - 1].nal_i = si; /* guard: ps_push no-ops on OOM */
 			}
 			if (type == 15) is_mvc = 1;
-			if (use_poc) {
-				if (type == 7)
-					h264_parse_sps(pc, bn[bi].start, bn[bi].end);
-				else if (type == 8)
-					h264_parse_pps(pc, bn[bi].start, bn[bi].end);
-				else if (type == 6 && h264_sei_is_recovery_point(bn[bi].start, bn[bi].end))
-					recovery_seen = 1;
-			}
+			if (type == 7)
+				h264_parse_sps(pc, bn[bi].start, bn[bi].end);
+			else if (type == 8)
+				h264_parse_pps(pc, bn[bi].start, bn[bi].end);
+			else if (use_poc && type == 6 && h264_sei_is_recovery_point(bn[bi].start, bn[bi].end))
+				recovery_seen = 1;
+			if (type == 10)
+				fp.pending = 0; /* end of sequence: the decoder pairs no field across it */
 			if ((type == 1 || type == 5) && seen_sps && seen_pps &&
 			    nal_is_pic_start(bn[bi].start, bn[bi].end, type, 1)) { /* counted base picture */
+				H264PicInfo pi;
+				int parsed = h264_parse_picture(pc, bn[bi].start, bn[bi].end, &pi);
+				if (use_poc && !parsed) { rc = 1; goto out; }
+				if (h264_second_field(&fp, &pi)) {
+					/* the second field of the frame counted last (see scan_index_pass) */
+					if (last_pushed && pi.poc < pb.v[pb.n - 1])
+						pb.v[pb.n - 1] = pi.poc;
+					recovery_seen = 0;
+					continue;
+				}
 				int leading = 0; /* left out by the decoder (see StartLeading) */
+				last_pushed = 0;
 				if (use_poc) {
-					H264PicInfo pi;
-					if (!h264_parse_picture(pc, bn[bi].start, bn[bi].end, &pi)) { rc = 1; goto out; }
 					leading = is_start_leading(&lead, &pi);
 					if (pi.is_idr) { /* an IDR ends the previous sequence and starts a new one */
 						if (flush_cvs(s, &pb, cvs_base, cvs_first_sp) < 0) { rc = 1; goto out; }
@@ -1438,6 +1463,7 @@ static int build_interleaved_pass(MvcSource *s, int use_poc, char *err, size_t e
 						h264_poc_reset(pc);
 					}
 					if (!leading && pocbuf_push(&pb, pi.poc) < 0) { rc = 1; goto out; }
+					last_pushed = !leading;
 					/* Every random-access point becomes a seek point; flush_cvs fills
 					 * in a recovery point's display index (valid_from) once its
 					 * sequence's picture order counts are known. */

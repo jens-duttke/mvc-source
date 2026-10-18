@@ -13,10 +13,11 @@
  * recovery point instead of only on IDRs.
  *
  * Scope is deliberately the minimum for that: the slice header is parsed only as
- * far as the POC fields, and only for base-view primary pictures. Anything this
- * cannot model (field coding, separate colour planes, an unknown parameter set)
- * makes the parse fail, and the caller falls back to IDR-only seek points - the
- * previously shipped, proven behaviour. Split into its own header so a test can
+ * far as the POC fields, and only for base-view primary pictures. Field pictures
+ * (PAFF) are modelled, the two fields of a frame being paired as the decoder
+ * pairs them (h264_second_field). Anything else this cannot model (separate
+ * colour planes, an unknown parameter set) makes the parse fail, and the caller
+ * falls back to IDR-only seek points - the previously shipped, proven behaviour. Split into its own header so a test can
  * compile it standalone (see tests/h264poctest.c), matching cache_budget.h.
  *
  * Conformance: this models H.264 8.2.1 for pic_order_cnt_type 0/1/2, but NOT the
@@ -251,16 +252,42 @@ static inline void h264_parse_pps(H264PocCtx *c, const uint8_t *nal, const uint8
 typedef struct {
 	int is_idr;     /* NAL type 5 */
 	int is_intra;   /* slice_type is I: the picture can start an open GOP */
-	int32_t poc;    /* picture order count (TopFieldOrderCnt for a frame) */
+	int32_t poc;    /* picture order count: of the field, or of the frame (the lower of its fields) */
+	int fields_ok;  /* the fields below were read (even if the POC derivation then failed) */
+	int field_pic, bottom_field, frame_num, nal_ref_idc;
 } H264PicInfo;
+
+/* The pending first field of a frame, which the next picture completes if it is
+ * the second field (see h264_second_field). */
+typedef struct { int pending, bottom, frame_num, reference; } H264FieldPair;
+
+/*
+ * Whether this picture is the second field of the frame whose first field came
+ * right before it, as the decoder pairs them (3.35, 3.36): a field of the other
+ * parity with the same frame_num and reference status, and not an IDR picture.
+ * Such a field is no frame of its own, so the caller does not count it. Any
+ * other picture ends the pending first field, a field becoming the next one.
+ * Must see every base primary picture in decode order, a picture whose fields
+ * could not be read (fields_ok 0) counting as a frame.
+ */
+static inline int h264_second_field(H264FieldPair *fp, const H264PicInfo *pi) {
+	int second = fp->pending && pi->fields_ok && pi->field_pic && pi->bottom_field != fp->bottom &&
+		!pi->is_idr && pi->frame_num == fp->frame_num && (pi->nal_ref_idc != 0) == fp->reference;
+	fp->pending = !second && pi->fields_ok && pi->field_pic;
+	fp->bottom = pi->bottom_field;
+	fp->frame_num = pi->frame_num;
+	fp->reference = pi->nal_ref_idc != 0;
+	return second;
+}
 
 /*
  * Parse the first slice of a base-view primary picture (NAL type 1 or 5) as far
- * as the POC fields and derive the picture's POC per H.264 8.2.1. `nal` points at
- * the NAL header byte. Returns 1 with *out filled, or 0 if this is not a first
- * slice or the stream uses something outside this parser's scope (field coding,
- * separate colour planes, an unknown/invalid parameter set) - the caller then
- * falls back to IDR-only seek points.
+ * as the POC fields and derive the picture's POC per H.264 8.2.1, for a frame or
+ * a field. `nal` points at the NAL header byte. Returns 1 with *out filled, or 0
+ * if this is not a first slice or the stream uses something outside this
+ * parser's scope (separate colour planes, an unknown/invalid parameter set) - the
+ * caller then falls back to IDR-only seek points. fields_ok tells whether the
+ * field flags were read even so.
  *
  * Must be called for every base primary picture in decode order and nowhere else:
  * the POC derivation is a state machine over that exact sequence.
@@ -274,6 +301,7 @@ static inline int h264_parse_picture(H264PocCtx *c, const uint8_t *nal, const ui
 	memset(out, 0, sizeof *out);
 	int nal_ref_idc = (nal[0] >> 5) & 3;
 	out->is_idr = (nal[0] & 0x1f) == 5;
+	out->nal_ref_idc = nal_ref_idc;
 
 	if (h264_ue(&b) != 0) return 0;   /* first_mb_in_slice != 0: not a picture's first slice */
 	uint32_t slice_type = h264_ue(&b);
@@ -286,15 +314,23 @@ static inline int h264_parse_picture(H264PocCtx *c, const uint8_t *nal, const ui
 	if (!s->valid || s->separate_colour_plane) return 0;
 
 	int frame_num = (int)h264_un(&b, s->log2_max_frame_num);
+	int field_pic = 0, bottom = 0;
 	if (!s->frame_mbs_only) {
-		/* field_pic_flag: a field-coded stream has two pictures per frame, which
-		 * breaks the caller's one-picture-per-frame count outright. Bail. */
-		if (h264_u1(&b)) return 0;
+		field_pic = h264_u1(&b);
+		if (field_pic) bottom = h264_u1(&b);
 	}
+	if (b.err) return 0;
+	out->fields_ok = 1;
+	out->field_pic = field_pic;
+	out->bottom_field = bottom;
+	out->frame_num = frame_num;
 	if (out->is_idr) h264_ue(&b);   /* idr_pic_id */
+	/* delta_pic_order_cnt_bottom and delta_pic_order_cnt[1] come with frames only */
+	int bottom_delta = c->pps[pps_id].bottom_field_poc_present && !field_pic;
 
 	if (s->poc_type == 0) {
 		int poc_lsb = (int)h264_un(&b, s->log2_max_poc_lsb);
+		int32_t delta_bottom = bottom_delta ? h264_se(&b) : 0;
 		if (b.err) return 0;
 		int max = 1 << s->log2_max_poc_lsb;
 		if (out->is_idr) { c->prev_poc_msb = 0; c->prev_poc_lsb = 0; }
@@ -305,7 +341,10 @@ static inline int h264_parse_picture(H264PocCtx *c, const uint8_t *nal, const ui
 			msb = c->prev_poc_msb - max;
 		else
 			msb = c->prev_poc_msb;
+		/* a field has its own order count (8-4 to 8-6), and a frame of an
+		 * interlaced stream the lower of its two, as the decoder orders them */
 		out->poc = msb + poc_lsb;
+		if (!field_pic && !s->frame_mbs_only && delta_bottom < 0) out->poc += delta_bottom;
 		/* only a reference picture advances the prev* pair (8.2.1.1) */
 		if (nal_ref_idc) { c->prev_poc_msb = msb; c->prev_poc_lsb = poc_lsb; }
 		return 1;
@@ -324,10 +363,10 @@ static inline int h264_parse_picture(H264PocCtx *c, const uint8_t *nal, const ui
 	}
 
 	/* poc_type 1 (8.2.1.2) */
-	int32_t delta_poc0 = 0;
+	int32_t delta_poc0 = 0, delta_poc1 = 0;
 	if (!s->delta_poc_always_zero) {
 		delta_poc0 = h264_se(&b);
-		if (c->pps[pps_id].bottom_field_poc_present) h264_se(&b);   /* delta_pic_order_cnt[1] */
+		if (bottom_delta) delta_poc1 = h264_se(&b);
 	}
 	if (b.err) return 0;
 	int32_t abs_fn = s->num_ref_frames_in_poc_cycle ? c->frame_num_offset + frame_num : 0;
@@ -342,7 +381,14 @@ static inline int h264_parse_picture(H264PocCtx *c, const uint8_t *nal, const ui
 		for (int i = 0; i <= idx; i++) expected += s->offset_for_ref_frame[i];
 	}
 	if (!nal_ref_idc) expected += s->offset_for_non_ref_pic;
-	out->poc = expected + delta_poc0;
+	/* 8-9 to 8-11: a top field or frame is at expected + delta[0], a bottom field
+	 * at expected + offset_for_top_to_bottom_field + delta[0], and the bottom of
+	 * a frame at its top + offset_for_top_to_bottom_field + delta[1]; a frame of an
+	 * interlaced stream takes the lower of its two, as the decoder orders them */
+	int32_t top = expected + delta_poc0;
+	int32_t bot = field_pic ? expected + s->offset_for_top_to_bottom_field + delta_poc0
+		: top + s->offset_for_top_to_bottom_field + delta_poc1;
+	out->poc = bottom ? bot : field_pic || s->frame_mbs_only || top < bot ? top : bot;
 	c->prev_frame_num = frame_num;
 	return 1;
 }

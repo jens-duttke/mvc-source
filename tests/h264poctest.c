@@ -273,8 +273,39 @@ static void test_recovery_point(void) {
 	      "recovery_point found behind an earlier SEI message");
 }
 
+/* The pairing of two fields into one frame, as the decoder pairs them: only a
+ * field of the other parity, with the same frame_num and reference status and
+ * not an IDR picture, completes the first field right before it. */
+static H264PicInfo field(int field_pic, int bottom, int frame_num, int ref, int idr) {
+	H264PicInfo pi = {0};
+	pi.fields_ok = 1;
+	pi.field_pic = field_pic;
+	pi.bottom_field = bottom;
+	pi.frame_num = frame_num;
+	pi.nal_ref_idc = ref;
+	pi.is_idr = idr;
+	return pi;
+}
+
+static void test_field_pairing(void) {
+	H264FieldPair fp = {0};
+	H264PicInfo pi;
+	pi = field(1, 0, 0, 1, 1); check(!h264_second_field(&fp, &pi), "an IDR top field starts a frame");
+	pi = field(1, 1, 0, 1, 0); check(h264_second_field(&fp, &pi), "the bottom field of the same frame_num completes it");
+	pi = field(1, 1, 1, 1, 0); check(!h264_second_field(&fp, &pi), "a field after a complete pair starts a frame");
+	pi = field(1, 1, 1, 1, 0); check(!h264_second_field(&fp, &pi), "a field of the same parity starts another frame");
+	pi = field(1, 0, 2, 1, 0); check(!h264_second_field(&fp, &pi), "a field of another frame_num starts another frame");
+	pi = field(1, 1, 2, 0, 0); check(!h264_second_field(&fp, &pi), "a field of another reference status starts another frame");
+	pi = field(0, 0, 3, 1, 0); check(!h264_second_field(&fp, &pi), "a frame ends a lone first field");
+	pi = field(1, 0, 3, 1, 0); check(!h264_second_field(&fp, &pi), "a field after a frame starts a frame");
+	pi = field(1, 1, 3, 1, 1); check(!h264_second_field(&fp, &pi), "an IDR field is never a second field");
+	pi = field(1, 0, 3, 1, 0); pi.fields_ok = 0; check(!h264_second_field(&fp, &pi), "an unread picture counts as a frame");
+	check(!fp.pending, "an unread picture leaves no first field pending");
+}
+
 int main(void) {
 	test_bits();
+	test_field_pairing();
 	test_rbsp();
 	test_param_set_id();
 	test_poc_type0();
@@ -282,6 +313,6 @@ int main(void) {
 	test_unknown_param_set();
 	test_recovery_point();
 	if (fails) { printf("RESULT: FAIL (%d)\n", fails); return 1; }
-	printf("RESULT: PASS (POC parser: bit reader, RBSP, ids, poc_type 0/2, recovery point)\n");
+	printf("RESULT: PASS (POC parser: bit reader, RBSP, ids, field pairing, poc_type 0/2, recovery point)\n");
 	return 0;
 }

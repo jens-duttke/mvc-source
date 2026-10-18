@@ -270,6 +270,11 @@ check: coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfail
 	    ./coretest "$(TEST_422)" 0 && \
 	    MOCKHOST_CHROMA=422 ASAN_OPTIONS=detect_leaks=1 ./mockhost-asan ./$(PLUGIN) "$(TEST_422)" base; \
 	else echo "  ($(TEST_422) missing: edge264-mvc older than v2026.10.17, which decodes no 4:2:2; skipping)"; fi
+	@echo "== field pictures (edge264-mvc fixtures): one frame per field pair, seeks match a sequential read =="
+	@if [ -f "$(TEST_PAFF)" ]; then \
+	    for f in $(TEST_PAFF) $(TEST_PAFF_MIXED); do ./coretest "$$f" 0 || exit 1; done && \
+	    ASAN_OPTIONS=detect_leaks=1 ./mockhost-asan ./$(PLUGIN) "$(TEST_PAFF)" base; \
+	else echo "  ($(TEST_PAFF) missing: edge264-mvc older than v2026.10.18, which decodes no field pictures; skipping)"; fi
 ifndef TEST_FILE
 	@echo "set TEST_FILE=<file.264> to run the suite, e.g. make check TEST_FILE=movie.264"
 	@exit 1
@@ -296,6 +301,12 @@ BITEXACT_FRAME ?= 5
 # a 4:2:2 stream that edge264-mvc v2026.10.17 and later carries as a fixture (5 frames)
 TEST_422 ?= $(EDGE264_SRC)/tests/conformance/2d/FREXT3_TANDBERG_A.264
 BITEXACT_FRAME_422 ?= 3
+# streams of field pictures that edge264-mvc v2026.10.18 and later carries as
+# fixtures: fields only, frames mixed with fields (CABAC and CAVLC), and fields
+# of which some lack their pair
+TEST_PAFF ?= $(EDGE264_SRC)/tests/conformance/2d/CVFI1_SVA_C.264
+TEST_PAFF_MIXED ?= $(EDGE264_SRC)/tests/conformance/2d/HCAFF1_HHI_B.264 $(EDGE264_SRC)/tests/conformance/2d/Sharp_MP_PAFF_1r2.264 $(EDGE264_SRC)/tests/conformance/2d-synthetic/unpaired_fields.264
+BITEXACT_FRAME_PAFF ?= 4
 check-bitexact: coretest
 ifndef TEST_FILE
 	@echo "set TEST_FILE=<file.264> to run the bit-exact check, e.g. make check-bitexact TEST_FILE=movie.264"
@@ -319,6 +330,18 @@ endif
 	  a=$$(md5sum < "$$core"); b=$$(md5sum < "$$ref"); \
 	  echo "core 4:2:2=$$a"; echo "ref  4:2:2=$$b"; \
 	  [ "$$a" = "$$b" ] && echo "bit-exact vs edge264 (4:2:2): OK" || { echo "MISMATCH (4:2:2)"; exit 1; }
+	@set -e; \
+	  if [ ! -f "$(TEST_PAFF)" ]; then echo "($(TEST_PAFF) missing: skipping the field picture bit-exact checks)"; exit 0; fi; \
+	  core=$$(mktemp); ref=$$(mktemp); \
+	  trap 'rm -f "$$core" "$$ref"' EXIT; \
+	  for t in "$(TEST_PAFF) $(BITEXACT_FRAME_PAFF) yuv420p" "$(firstword $(TEST_PAFF_MIXED)) $(BITEXACT_FRAME_PAFF) yuv420p"; do \
+	    set -- $$t; \
+	    ./coretest "$$1" 0 $$2 "$$core"; \
+	    sh tests/mkref.sh "$(EDGE264_SRC)/edge264mvc_test" "$$1" $$2 "$$ref" $$3; \
+	    a=$$(md5sum < "$$core"); b=$$(md5sum < "$$ref"); \
+	    echo "core $$(basename $$1) frame $$2=$$a"; echo "ref  $$(basename $$1) frame $$2=$$b"; \
+	    [ "$$a" = "$$b" ] && echo "bit-exact vs edge264 ($$(basename $$1)): OK" || { echo "MISMATCH ($$(basename $$1))"; exit 1; }; \
+	  done
 
 # Full end-to-end AviSynth+ check: load the built plugin through a real AviSynth+
 # runtime (properties, layouts, error paths), then bit-exact vs an edge264
