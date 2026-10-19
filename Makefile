@@ -282,6 +282,12 @@ check: coretest twofiletest mockhost mockhost-asan seektest enomemtest allocfail
 	    for f in $(TEST_PAFF) $(TEST_PAFF_MIXED); do ./coretest "$$f" 0 || exit 1; done && \
 	    ASAN_OPTIONS=detect_leaks=1 ./mockhost-asan ./$(PLUGIN) "$(TEST_PAFF)" base; \
 	else echo "  ($(TEST_PAFF) missing: edge264-mvc older than v2026.10.18, which decodes no field pictures; skipping)"; fi
+	@echo "== MBAFF frames (edge264-mvc fixtures): 2D, mixed with field pictures, and both views of MVC =="
+	@if [ -f "$(TEST_MBAFF)" ]; then \
+	    for f in $(TEST_MBAFF) $(TEST_MBAFF_MIXED); do ./coretest "$$f" 0 || exit 1; done && \
+	    for l in 0 1 2; do ./coretest "$(TEST_MBAFF_MVC)" $$l || exit 1; done && \
+	    ASAN_OPTIONS=detect_leaks=1 ./mockhost-asan ./$(PLUGIN) "$(TEST_MBAFF_MVC)" tab; \
+	else echo "  ($(TEST_MBAFF) missing: edge264-mvc older than v2026.10.19, which decodes no MBAFF frames; skipping)"; fi
 ifndef TEST_FILE
 	@echo "set TEST_FILE=<file.264> to run the suite, e.g. make check TEST_FILE=movie.264"
 	@exit 1
@@ -319,6 +325,13 @@ BITEXACT_FRAME_10BIT ?= 7
 TEST_PAFF ?= $(EDGE264_SRC)/tests/conformance/2d/CVFI1_SVA_C.264
 TEST_PAFF_MIXED ?= $(EDGE264_SRC)/tests/conformance/2d/HCAFF1_HHI_B.264 $(EDGE264_SRC)/tests/conformance/2d/Sharp_MP_PAFF_1r2.264 $(EDGE264_SRC)/tests/conformance/2d-synthetic/unpaired_fields.264
 BITEXACT_FRAME_PAFF ?= 4
+# MBAFF frames that edge264-mvc v2026.10.19 and later carries as fixtures: P and B
+# slices with constrained intra prediction, MBAFF frames mixed with field
+# pictures, and both views of MVC
+TEST_MBAFF ?= $(EDGE264_SRC)/tests/conformance/2d/CAMACI3_Sony_C.264
+TEST_MBAFF_MIXED ?= $(EDGE264_SRC)/tests/conformance/2d/MR9_BT_B.264
+TEST_MBAFF_MVC ?= $(EDGE264_SRC)/tests/conformance/mvc-jmvc/mvcict2_mbaff.264
+BITEXACT_FRAME_MBAFF ?= 6
 check-bitexact: coretest
 ifndef TEST_FILE
 	@echo "set TEST_FILE=<file.264> to run the bit-exact check, e.g. make check-bitexact TEST_FILE=movie.264"
@@ -354,6 +367,17 @@ endif
 	    a=$$(md5sum < "$$core"); b=$$(md5sum < "$$ref"); \
 	    echo "core $$(basename $$1) frame $$2=$$a"; echo "ref  $$(basename $$1) frame $$2=$$b"; \
 	    [ "$$a" = "$$b" ] && echo "bit-exact vs edge264 ($$(basename $$1)): OK" || { echo "MISMATCH ($$(basename $$1))"; exit 1; }; \
+	  done
+	@set -e; \
+	  if [ ! -f "$(TEST_MBAFF)" ]; then echo "($(TEST_MBAFF) missing: skipping the MBAFF bit-exact checks)"; exit 0; fi; \
+	  core=$$(mktemp); ref=$$(mktemp); \
+	  trap 'rm -f "$$core" "$$ref"' EXIT; \
+	  for f in $(TEST_MBAFF) $(TEST_MBAFF_MIXED) $(TEST_MBAFF_MVC); do \
+	    ./coretest "$$f" 0 $(BITEXACT_FRAME_MBAFF) "$$core"; \
+	    sh tests/mkref.sh "$(EDGE264_SRC)/edge264mvc_test" "$$f" $(BITEXACT_FRAME_MBAFF) "$$ref"; \
+	    a=$$(md5sum < "$$core"); b=$$(md5sum < "$$ref"); \
+	    echo "core $$(basename $$f) frame $(BITEXACT_FRAME_MBAFF)=$$a"; echo "ref  $$(basename $$f) frame $(BITEXACT_FRAME_MBAFF)=$$b"; \
+	    [ "$$a" = "$$b" ] && echo "bit-exact vs edge264 ($$(basename $$f)): OK" || { echo "MISMATCH ($$(basename $$f))"; exit 1; }; \
 	  done
 
 # Full end-to-end AviSynth+ check: load the built plugin through a real AviSynth+
