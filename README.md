@@ -78,7 +78,7 @@ The output is YUV 4:2:0 (4:2:2 for a 4:2:2 stream) at the bit depth of the strea
 
 ## Supported streams
 
-mvc-source decodes what edge264-mvc decodes: the **High**, **High 10**, **High 4:2:2** and **Stereo High** (MVC, 2 views) profiles of H.264, with 4:2:0, 4:2:2 or monochrome video of 8 to 10 bits, in frames and in field pictures, which covers 3D Blu-ray and nearly all 2D H.264 in use. Macroblock-adaptive frame/field coding (MBAFF), more than 10 bits and 4:4:4 chroma are not supported.
+mvc-source decodes what edge264-mvc decodes: the **High**, **High 10**, **High 4:2:2** and **Stereo High** (MVC, 2 views) profiles of H.264, with 4:2:0, 4:2:2 or monochrome video of 8 to 10 bits, in frames, in field pictures and with macroblock-adaptive frame/field coding (MBAFF), which covers 3D Blu-ray, interlaced 3D camcorder video and nearly all 2D H.264 in use. More than 10 bits and 4:4:4 chroma are not supported.
 
 ## Building
 
