@@ -178,7 +178,7 @@ jobs:
           file libavsmvc.dll
           x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -A2 "Ordinal/Name Pointer"
           # exactly avisynth_c_plugin_init is exported and no edge264 symbol leaks
-          x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -q "] avisynth_c_plugin_init"
+          x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -qE "^\s*\[ *[0-9]+\].* avisynth_c_plugin_init$"
           test "$(x86_64-w64-mingw32-objdump -p libavsmvc.dll | grep -c -i edge264)" = "0"
           make libvsmvc.dll CC=x86_64-w64-mingw32-gcc DLLTOOL=x86_64-w64-mingw32-dlltool \
             EDGE264_SRC=../edge264-win EDGE264_MAKE="OS=windows CC=x86_64-w64-mingw32-gcc CFLAGS=-march=x86-64 VARIANTS=x86-64-v2,x86-64-v3"
